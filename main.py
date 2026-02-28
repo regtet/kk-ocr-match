@@ -50,10 +50,10 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QFileDialog, QProgressBar,
     QTableWidget, QTableWidgetItem, QMessageBox, QGroupBox, QSlider,
     QScrollArea, QListWidget, QListWidgetItem, QHeaderView, QFrame,
-    QLineEdit, QGraphicsDropShadowEffect, QCheckBox, QButtonGroup
+    QLineEdit, QGraphicsDropShadowEffect, QCheckBox, QButtonGroup, QSizePolicy
 )
 from PySide6.QtCore import Qt, Signal, QThread, QSize, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QRect
-from PySide6.QtGui import QPixmap, QIcon, QColor, QFont, QPainter, QPen, QBrush, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QPixmap, QIcon, QColor, QFont, QPainter, QPen, QBrush, QDragEnterEvent, QDropEvent, QImageReader
 
 # OCR API
 import subprocess
@@ -210,6 +210,29 @@ class OCRController:
             self.proc = None
 
 
+class ImageSizeWorker(QThread):
+    """异步读取图片尺寸的工作线程"""
+    size_ready = Signal(str, int, int)  # img_path, width, height
+    finished_batch = Signal()
+
+    def __init__(self, image_paths: List[str]):
+        super().__init__()
+        self.image_paths = image_paths
+
+    def run(self):
+        for img_path in self.image_paths:
+            if self.isInterruptionRequested():
+                break
+            try:
+                if os.path.exists(img_path):
+                    with Image.open(img_path) as img:
+                        w, h = img.size
+                        self.size_ready.emit(img_path, w, h)
+            except Exception:
+                pass
+        self.finished_batch.emit()
+
+
 class OCRWorker(QThread):
     """OCR识别工作线程（支持实时更新）"""
     progress = Signal(str, str, str)  # 图片路径, OCR文本, 状态消息
@@ -332,7 +355,8 @@ class ImageCard(QFrame):
         """)
         # 不直接拉伸内容，由代码中根据比例预缩放 QPixmap
         self.image_label.setScaledContents(False)
-        self.load_image(img_path)
+        # 延迟加载缩略图，避免批量创建卡片时主线程阻塞导致卡顿
+        QTimer.singleShot(0, lambda p=img_path: self.load_image(p))
         layout.addWidget(self.image_label)
 
         # 匹配状态角标：真正悬浮在卡片上方（不参与任何布局）
@@ -417,19 +441,32 @@ class ImageCard(QFrame):
         # 设置鼠标事件
         self.setCursor(Qt.PointingHandCursor)
     
+    # 缩略图最大边长，大图先缩小再显示，减轻卡顿
+    _THUMB_MAX = 600
+
     def load_image(self, img_path: str):
-        """加载图片（更大更清晰，支持多种格式）"""
+        """加载图片（支持多格式；大图自动缩略以减轻卡顿）"""
         try:
-            # 检查文件是否存在
             if not os.path.exists(img_path):
                 self.image_label.setText(f"文件不存在\n{os.path.basename(img_path)}")
-                # 仅在文件缺失时简单提示一次
                 print(f"[图片加载] 文件不存在: {img_path}")
                 return
-            
-            # 先尝试直接用QPixmap加载
-            pixmap = QPixmap(img_path)
-            
+
+            pixmap = None
+            reader = QImageReader(img_path)
+            if reader.canRead():
+                sz = reader.size()
+                if sz.isValid() and (sz.width() > self._THUMB_MAX or sz.height() > self._THUMB_MAX):
+                    scale = min(self._THUMB_MAX / sz.width(), self._THUMB_MAX / sz.height())
+                    new_w = max(1, int(sz.width() * scale))
+                    new_h = max(1, int(sz.height() * scale))
+                    reader.setScaledSize(QSize(new_w, new_h))
+                    img = reader.read()
+                    if not img.isNull():
+                        pixmap = QPixmap.fromImage(img)
+            if pixmap is None or pixmap.isNull():
+                pixmap = QPixmap(img_path)
+
             # 如果QPixmap加载失败，尝试用PIL转换格式
             if pixmap.isNull():
                 # QPixmap 失败时尝试使用 PIL 兜底，不再频繁打印日志
@@ -672,9 +709,7 @@ class OCRImageMatcher(QMainWindow):
         self.group_a_info: Dict[str, dict] = {}
         self.group_b_info: Dict[str, dict] = {}
         self.matches: List[Tuple[str, str, float]] = []
-        self.threshold = 0.80  # 默认80%
-        # 是否在自动匹配时忽略尺寸限制
-        self.ignore_size_limit: bool = False
+        self.threshold = 0.70  # 默认70%，过高易导致无匹配
 
         # A/B 过滤模式：all | unmatched | matched
         self.a_filter_mode: str = "all"
@@ -692,7 +727,11 @@ class OCRImageMatcher(QMainWindow):
         # 当前 A 组焦点及对应的 B 组推荐列表（path -> rank）
         self.current_a_focus: Optional[str] = None
         self.b_suggestions: Dict[str, int] = {}
-        
+        # 防抖：点击 A 卡后延迟刷新 B 表
+        self._pending_update_b_timer: Optional[QTimer] = None
+        self._threshold_timer: Optional[QTimer] = None
+        self._resize_debounce_timer: Optional[QTimer] = None
+
         # OCR引擎
         self.ocr_controller = None
         self.exe_path = self.find_paddleocr_exe()
@@ -717,7 +756,8 @@ class OCRImageMatcher(QMainWindow):
         # 工作线程
         self.worker_a: Optional[OCRWorker] = None
         self.worker_b: Optional[OCRWorker] = None
-        
+        self.size_worker: Optional[ImageSizeWorker] = None
+
         self.init_ui()
     
     def find_paddleocr_exe(self):
@@ -753,8 +793,8 @@ class OCRImageMatcher(QMainWindow):
         self.setCentralWidget(central_widget)
         
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(12, 12, 12, 12)
         
         # ========== A. 顶部栏 ==========
         header_frame = QFrame()
@@ -784,18 +824,14 @@ class OCRImageMatcher(QMainWindow):
         threshold_label.setStyleSheet("color: #333; font-size: 12px;")
         self.threshold_slider = QSlider(Qt.Horizontal)
         self.threshold_slider.setRange(50, 100)
-        self.threshold_slider.setValue(80)
+        self.threshold_slider.setValue(70)
+        self.threshold_slider.setMinimumWidth(120)
         self.threshold_slider.valueChanged.connect(self.on_threshold_changed)
-        self.threshold_value_label = QLabel("80%")
+        self.threshold_value_label = QLabel("70%")
         self.threshold_value_label.setStyleSheet("color: #0078D4; font-weight: bold; min-width: 50px;")
         threshold_layout.addWidget(threshold_label)
         threshold_layout.addWidget(self.threshold_slider)
         threshold_layout.addWidget(self.threshold_value_label)
-        # 尺寸限制复选框
-        self.size_limit_checkbox = QCheckBox("仅匹配相同尺寸")
-        self.size_limit_checkbox.setChecked(True)
-        self.size_limit_checkbox.stateChanged.connect(self.on_size_limit_changed)
-        threshold_layout.addWidget(self.size_limit_checkbox)
         header_layout.addLayout(threshold_layout)
 
         # 匹配进度总览
@@ -816,30 +852,34 @@ class OCRImageMatcher(QMainWindow):
         
         main_layout.addWidget(header_frame)
         
-        # ========== B. 中间主体 - 双栏设计 ==========
-        body_layout = QHBoxLayout()
-        body_layout.setSpacing(15)
-        
-        # 左侧：A组（标准参考区）
+        # ========== B. 三栏对比操作台（左 A | 中 操作 | 右 B）==========
+        body_container = QWidget()
+        body_layout = QHBoxLayout(body_container)
+        body_layout.setSpacing(24)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 左侧：A 组（标准参考区）
         a_group = QGroupBox("A 组（标准参考区）")
+        a_group.setMinimumWidth(480)
         a_group.setStyleSheet("""
             QGroupBox {
                 font-size: 14px;
                 font-weight: bold;
                 border: 2px solid #0078D4;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 15px;
+                border-radius: 6px;
+                margin-top: 8px;
+                padding: 8px 10px 10px 10px;
+                padding-top: 12px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 10px;
-                padding: 0 5px;
+                padding: 0 6px;
                 color: #0078D4;
             }
         """)
         a_layout = QVBoxLayout()
-        a_layout.setSpacing(10)
+        a_layout.setSpacing(8)
         
         # A组选择按钮（支持文件和文件夹）
         a_btn_layout = QHBoxLayout()
@@ -901,7 +941,7 @@ class OCRImageMatcher(QMainWindow):
         
         # A组路径显示
         self.a_folder_label = QLabel("未选择（支持拖拽图片或文件夹到此区域）")
-        self.a_folder_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
+        self.a_folder_label.setStyleSheet("color: #666; font-size: 11px; padding: 2px 0;")
         self.a_folder_label.setWordWrap(True)
         a_layout.addWidget(self.a_folder_label)
 
@@ -981,9 +1021,8 @@ class OCRImageMatcher(QMainWindow):
         self.a_cards_widget = QWidget()
         # 使用网格布局，实现多列排布
         self.a_cards_layout = QGridLayout(self.a_cards_widget)
-        # 适当减小间距，让画廊更紧凑
-        self.a_cards_layout.setSpacing(8)
-        self.a_cards_layout.setContentsMargins(8, 8, 8, 8)
+        self.a_cards_layout.setSpacing(6)
+        self.a_cards_layout.setContentsMargins(6, 6, 6, 6)
         # 内容始终靠左上对齐，避免图片少时居中留大空白
         self.a_cards_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         
@@ -993,26 +1032,49 @@ class OCRImageMatcher(QMainWindow):
         a_group.setLayout(a_layout)
         body_layout.addWidget(a_group, 1)
         
-        # 右侧：B组（待处理区）
+        # 中间：操作按钮区（固定宽度、卡片样式）
+        center_buttons_frame = QFrame()
+        center_buttons_frame.setFixedWidth(240)
+        center_buttons_frame.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Expanding
+        )
+        center_buttons_frame.setStyleSheet("""
+            QFrame {
+                background-color: #F3F2F1;
+                border: 1px solid #E1DFDD;
+                border-radius: 6px;
+                padding: 12px;
+            }
+        """)
+        center_vbox = QVBoxLayout(center_buttons_frame)
+        center_vbox.setSpacing(8)
+        center_vbox.setContentsMargins(12, 16, 12, 16)
+        center_vbox.addStretch(1)  # 顶部弹性空间，实现垂直居中
+
+        body_layout.addWidget(center_buttons_frame, 0)
+        
+        # 右侧：B 组（待处理区）
         b_group = QGroupBox("B 组（待处理区）")
+        b_group.setMinimumWidth(480)
         b_group.setStyleSheet("""
             QGroupBox {
                 font-size: 14px;
                 font-weight: bold;
                 border: 2px solid #0078D4;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 15px;
+                border-radius: 6px;
+                margin-top: 8px;
+                padding: 8px 10px 10px 10px;
+                padding-top: 12px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 left: 10px;
-                padding: 0 5px;
+                padding: 0 6px;
                 color: #0078D4;
             }
         """)
         b_layout = QVBoxLayout()
-        b_layout.setSpacing(10)
+        b_layout.setSpacing(8)
         
         # B组选择按钮（支持文件和文件夹）
         b_btn_layout = QHBoxLayout()
@@ -1074,7 +1136,7 @@ class OCRImageMatcher(QMainWindow):
         
         # B组路径显示
         self.b_folder_label = QLabel("未选择（支持拖拽图片或文件夹到此区域）")
-        self.b_folder_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
+        self.b_folder_label.setStyleSheet("color: #666; font-size: 11px; padding: 2px 0;")
         self.b_folder_label.setWordWrap(True)
         b_layout.addWidget(self.b_folder_label)
 
@@ -1151,9 +1213,8 @@ class OCRImageMatcher(QMainWindow):
         self.b_cards_widget = QWidget()
         # 使用网格布局，实现多列排布
         self.b_cards_layout = QGridLayout(self.b_cards_widget)
-        self.b_cards_layout.setSpacing(8)
-        self.b_cards_layout.setContentsMargins(8, 8, 8, 8)
-        # 内容始终靠左上对齐，避免图片少时居中留大空白
+        self.b_cards_layout.setSpacing(6)
+        self.b_cards_layout.setContentsMargins(6, 6, 6, 6)
         self.b_cards_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         
         self.b_scroll.setWidget(self.b_cards_widget)
@@ -1161,26 +1222,66 @@ class OCRImageMatcher(QMainWindow):
         
         b_group.setLayout(b_layout)
         body_layout.addWidget(b_group, 1)
-        
-        main_layout.addLayout(body_layout, 2)
-        
-        # ========== C. 底部操作栏 ==========
-        footer_frame = QFrame()
-        footer_frame.setStyleSheet("""
-            QFrame {
-                background-color: #f8f9fa;
+
+        main_layout.addWidget(body_container, 2)
+
+        # 中间操作区：添加操作按钮到 center_vbox（已在上面创建并加入 body_layout）
+        btn_style = """
+            QPushButton {
+                background-color: #FFFFFF;
+                color: #323130;
+                border: 1px solid #A19F9D;
                 border-radius: 8px;
-                padding: 15px;
+                padding: 10px 18px;
+                font-size: 13px;
+                font-weight: bold;
+                min-height: 44px;
+                min-width: 160px;
             }
+            QPushButton:hover { background-color: #f3f2f1; }
+            QPushButton:pressed { background-color: #e1dfdd; padding-top: 11px; padding-left: 19px; }
+            QPushButton:disabled { color: #A19F9D; border-color: #C8C6C4; }
+        """
+        self.clear_all_btn = QPushButton("🧹 清空已上传图片")
+        self.clear_all_btn.setStyleSheet(btn_style)
+        self.clear_all_btn.clicked.connect(self.clear_all_images)
+        center_vbox.addWidget(self.clear_all_btn)
+        self.clear_b_btn = QPushButton("🧹 只清空B组")
+        self.clear_b_btn.setStyleSheet(btn_style)
+        self.clear_b_btn.clicked.connect(self.clear_b_images)
+        center_vbox.addWidget(self.clear_b_btn)
+        # 选中两张图时显示匹配度
+        self.pair_similarity_label = QLabel("请选择 A 组和 B 组各一张图片")
+        self.pair_similarity_label.setStyleSheet("color: #605E5C; font-size: 11px; padding: 4px 0;")
+        self.pair_similarity_label.setWordWrap(True)
+        self.pair_similarity_label.setAlignment(Qt.AlignCenter)
+        center_vbox.addWidget(self.pair_similarity_label)
+        self.manual_match_btn = QPushButton("✅ 确认手动配对")
+        self.manual_match_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078D4;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 12px 20px;
+                font-size: 13px;
+                font-weight: bold;
+                min-height: 44px;
+            }
+            QPushButton:hover { background-color: #106ebe; }
+            QPushButton:pressed { background-color: #005a9e; }
+            QPushButton:disabled { background-color: #A19F9D; color: #666; }
         """)
-        footer_layout = QVBoxLayout(footer_frame)
-        footer_layout.setSpacing(10)
-        
-        # 操作按钮
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(15)
-        
-        # 一键自动匹配（主操作按钮，当前已改为在识别完成后自动触发，这里只保留占位以便后续扩展）
+        self.manual_match_btn.clicked.connect(self.manual_match)
+        self.manual_match_btn.setEnabled(False)
+        center_vbox.addWidget(self.manual_match_btn)
+        center_vbox.addStretch(1)  # 底部弹性空间，与顶部对称实现垂直居中
+
+        # 按钮宽度适应 240px 中间区
+        for btn in (self.clear_all_btn, self.clear_b_btn, self.manual_match_btn):
+            btn.setMaximumWidth(216)
+
+        # 隐藏按钮（供程序内部调用）
         self.auto_match_btn = QPushButton("🚀 自动匹配")
         self.auto_match_btn.setStyleSheet("""
             QPushButton {
@@ -1207,12 +1308,9 @@ class OCRImageMatcher(QMainWindow):
             }
         """)
         self.auto_match_btn.clicked.connect(self.auto_match_and_rename)
-        # 不再提供给用户点击：仅用于内部调用自动匹配逻辑
         self.auto_match_btn.setVisible(False)
         self.auto_match_btn.setEnabled(False)
-        button_layout.addWidget(self.auto_match_btn)
 
-        # 批量执行重命名按钮（已废弃，不再展示）
         self.apply_rename_btn = QPushButton("💾 批量执行重命名")
         self.apply_rename_btn.setStyleSheet("""
             QPushButton {
@@ -1240,104 +1338,22 @@ class OCRImageMatcher(QMainWindow):
             }
         """)
         self.apply_rename_btn.clicked.connect(self.apply_matched_renames)
-        # 不再提供给用户点击：内部仍保留逻辑以便自动调用
         self.apply_rename_btn.setVisible(False)
         self.apply_rename_btn.setEnabled(False)
-        button_layout.addWidget(self.apply_rename_btn)
 
-        # 清空已上传图片按钮
-        self.clear_all_btn = QPushButton("🧹 清空已上传图片")
-        self.clear_all_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FFFFFF;
-                color: #323130;
-                border: 1px solid #A19F9D;
-                border-radius: 8px;
-                padding: 10px 18px;
-                font-size: 13px;
-                font-weight: bold;
-                min-height: 44px;
-            }
-            QPushButton:hover {
-                background-color: #f3f2f1;
-            }
-            QPushButton:pressed {
-                background-color: #e1dfdd;
-                padding-top: 11px;
-                padding-left: 19px;
-            }
-            QPushButton:disabled {
-                color: #A19F9D;
-                border-color: #C8C6C4;
+        # ========== C. 底部操作栏（仅日志）==========
+        footer_frame = QFrame()
+        footer_frame.setStyleSheet("""
+            QFrame {
+                background-color: #f8f9fa;
+                border-radius: 6px;
+                padding: 10px 12px;
             }
         """)
-        self.clear_all_btn.clicked.connect(self.clear_all_images)
-        button_layout.addWidget(self.clear_all_btn)
+        footer_layout = QVBoxLayout(footer_frame)
+        footer_layout.setSpacing(10)
 
-        # 只清空 B 组按钮
-        self.clear_b_btn = QPushButton("🧹 只清空B组")
-        self.clear_b_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #FFFFFF;
-                color: #323130;
-                border: 1px solid #A19F9D;
-                border-radius: 8px;
-                padding: 10px 18px;
-                font-size: 13px;
-                font-weight: bold;
-                min-height: 44px;
-            }
-            QPushButton:hover {
-                background-color: #f3f2f1;
-            }
-            QPushButton:pressed {
-                background-color: #e1dfdd;
-                padding-top: 11px;
-                padding-left: 19px;
-            }
-            QPushButton:disabled {
-                color: #A19F9D;
-                border-color: #C8C6C4;
-            }
-        """)
-        self.clear_b_btn.clicked.connect(self.clear_b_images)
-        button_layout.addWidget(self.clear_b_btn)
-        
-        # 确认手动配对（扁平化）
-        self.manual_match_btn = QPushButton("✅ 确认手动配对")
-        self.manual_match_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #0078D4;
-                color: white;
-                border: none;
-                border-radius: 8px;
-                padding: 15px 30px;
-                font-size: 14px;
-                font-weight: bold;
-                min-height: 50px;
-            }
-            QPushButton:hover {
-                background-color: #106ebe;
-            }
-            QPushButton:pressed {
-                background-color: #005a9e;
-                padding-top: 16px;
-                padding-left: 31px;
-            }
-            QPushButton:disabled {
-                background-color: #A19F9D;
-                color: #666;
-            }
-        """)
-        self.manual_match_btn.clicked.connect(self.manual_match)
-        self.manual_match_btn.setEnabled(False)
-        button_layout.addWidget(self.manual_match_btn)
-        
-        button_layout.addStretch()
-        footer_layout.addLayout(button_layout)
-        
         # A/B 文本差异对比视图（已取消展示）
-        from PySide6.QtWidgets import QSizePolicy
         self.diff_text = QTextEdit()
         self.diff_text.setReadOnly(True)
         self.diff_text.setAcceptRichText(True)
@@ -1377,20 +1393,124 @@ class OCRImageMatcher(QMainWindow):
         scrollbar = self.log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def update_diff_view(self):
-        """已禁用底部 A/B 文本差异对比视图"""
-        return
-    
     def on_threshold_changed(self, value):
         """相似度阈值改变"""
         self.threshold = value / 100.0
         self.threshold_value_label.setText(f"{value}%")
+        self._update_pair_similarity_label()
+        # 防抖：延迟触发重新匹配，避免拖动时频繁执行
+        if getattr(self, "_threshold_timer", None):
+            try:
+                self._threshold_timer.stop()
+            except Exception:
+                pass
+        self._threshold_timer = QTimer(self)
+        self._threshold_timer.setSingleShot(True)
+        self._threshold_timer.timeout.connect(self._on_threshold_debounced)
+        self._threshold_timer.start(400)
 
-    def on_size_limit_changed(self, state):
-        """是否忽略尺寸限制复选框变化"""
-        # 选中表示“仅匹配相同尺寸”，未选中则忽略尺寸限制
-        self.ignore_size_limit = (state == Qt.Unchecked)
-    
+    def _on_threshold_debounced(self):
+        """相似度阈值变更后延迟重匹配"""
+        if hasattr(self, "_threshold_timer"):
+            self._threshold_timer = None
+        if self.group_a_texts and self.group_b_texts:
+            self.refresh_matching()
+
+    def _update_pair_similarity_label(self):
+        """选中 A+B 各一张时，显示当前匹配度、阈值要求及可能的匹配阻碍"""
+        if not hasattr(self, "pair_similarity_label"):
+            return
+        if not self.selected_a_card or not self.selected_b_card:
+            self.pair_similarity_label.setText("请选择 A 组和 B 组各一张图片")
+            return
+        a_path = self.selected_a_card.img_path
+        b_path = self.selected_b_card.img_path
+        a_text = self.group_a_texts.get(a_path, "") or ""
+        b_text = self.group_b_texts.get(b_path, "") or ""
+        if not a_text.strip() or not b_text.strip():
+            self.pair_similarity_label.setText("请先完成两张图的 OCR 识别")
+            return
+        if FUZZYWUZZY_AVAILABLE:
+            sim = fuzz.ratio(a_text, b_text) / 100.0
+        else:
+            import difflib
+            sim = difflib.SequenceMatcher(None, a_text, b_text).ratio()
+        pct = int(sim * 100)
+        thresh_pct = int(self.threshold * 100)
+        lines = [f"匹配度 {pct}%"]
+        if sim >= self.threshold:
+            lines.append(f"≥ 阈值 {thresh_pct}%（文本达标）")
+        else:
+            lines.append(f"< 阈值 {thresh_pct}%（需降低阈值）")
+        # 尺寸比例一致：宽高比需相同（约 5% 误差）
+        a_info = self.group_a_info.get(a_path, {})
+        b_info = self.group_b_info.get(b_path, {})
+        aw, ah = a_info.get('width', 0) or 0, a_info.get('height', 0) or 0
+        bw, bh = b_info.get('width', 0) or 0, b_info.get('height', 0) or 0
+        if aw and ah and bw and bh:
+            ar, br = aw / ah, bw / bh
+            ratio_ok = abs(ar - br) / max(ar, br, 0.001) <= 0.05
+            if ratio_ok:
+                lines.append("尺寸比例一致 ✓")
+            else:
+                lines.append("⚠ 尺寸比例不一致，自动匹配会跳过")
+        # 一对一约束
+        a_used = self.group_a_info.get(a_path, {}).get("used", False)
+        b_matched = self.group_b_info.get(b_path, {}).get("matched", False)
+        if a_used and not b_matched and sim >= self.threshold:
+            lines.append("（该 A 已被其他 B 抢先匹配，可点击「确认手动配对」强制配对）")
+        self.pair_similarity_label.setText("\n".join(lines))
+
+    def refresh_matching(self):
+        """重置匹配状态、按内容相似度重新匹配、刷新 UI、执行重命名"""
+        if not self.group_a_texts or not self.group_b_texts:
+            return
+        # 过渡反馈
+        self.summary_label.setText("正在更新匹配…")
+        QApplication.processEvents()
+        # 重置匹配状态（仅对未真正重命名的项）
+        for b_path, b_info in self.group_b_info.items():
+            if not b_info.get("renamed", False):
+                b_info["matched"] = False
+                b_info.pop("matched_a_path", None)
+                b_info.pop("new_name", None)
+                b_info.pop("similarity", None)
+        for a_path in self.group_a_info:
+            self.group_a_info[a_path]["used"] = False
+        # 重新执行匹配逻辑并执行重命名
+        self.run_matching_logic()
+        matched_count = sum(1 for info in self.group_b_info.values() if info.get("matched"))
+        self.update_a_table()
+        self.update_b_table()
+        self.update_buttons_state()  # 内含 update_summary
+        self.apply_matched_renames()
+        if matched_count == 0:
+            self.log("未找到匹配，请检查：1) A/B 组是否均已完成 OCR 识别 2) 相似度阈值是否过高（当前 {}%）".format(int(self.threshold * 100)))
+
+    def start_size_worker(self, image_paths: List[str], group: str):
+        """异步读取图片尺寸并更新 UI"""
+        if not image_paths:
+            return
+        if self.size_worker and self.size_worker.isRunning():
+            self.size_worker.requestInterruption()
+            self.size_worker.wait(500)
+        self.size_worker = ImageSizeWorker(image_paths)
+        self.size_worker.size_ready.connect(lambda p, w, h, g=group: self.on_image_size_ready(p, w, h, g))
+        self.size_worker.start()
+
+    def on_image_size_ready(self, img_path: str, width: int, height: int, group: str):
+        """收到异步尺寸结果，更新 info 和卡片"""
+        if group == 'a':
+            if img_path in self.group_a_info:
+                self.group_a_info[img_path]['width'] = width
+                self.group_a_info[img_path]['height'] = height
+                self.update_a_card(img_path)
+        else:
+            if img_path in self.group_b_info:
+                self.group_b_info[img_path]['width'] = width
+                self.group_b_info[img_path]['height'] = height
+                self.update_b_card(img_path)
+
     def scan_folder(self, folder_path: str) -> List[str]:
         """扫描文件夹中的图片文件"""
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp', '.avif'}
@@ -1489,6 +1609,9 @@ class OCRImageMatcher(QMainWindow):
         # 更新表格显示
         self.update_a_table()
         
+        # 异步读取图片尺寸，上传后立即展示
+        self.start_size_worker(image_files, 'a')
+
         # 自动启动OCR识别（只识别新图片）
         if self.ocr_controller:
             new_images = [img for img in image_files if img not in self.group_a_texts]
@@ -1522,6 +1645,9 @@ class OCRImageMatcher(QMainWindow):
         # 更新表格显示
         self.update_b_table()
         
+        # 异步读取图片尺寸，上传后立即展示
+        self.start_size_worker(image_files, 'b')
+
         # 自动启动OCR识别（只识别新图片）
         if self.ocr_controller:
             new_images = [img for img in image_files if img not in self.group_b_texts]
@@ -1707,13 +1833,15 @@ class OCRImageMatcher(QMainWindow):
         return card
     
     def update_a_card(self, img_path: str):
-        """更新A组图片卡片"""
+        """更新A组图片卡片（含 OCR 文本与尺寸）"""
         if img_path in self.a_cards:
             card = self.a_cards[img_path]
             text = self.group_a_texts.get(img_path, "")
             card.update_text(text)
+            info = self.group_a_info.get(img_path, {})
+            w, h = info.get("width", 0) or 0, info.get("height", 0) or 0
+            card.update_size(w, h)
         else:
-            # 如果卡片不存在，整体重建一次卡片网格
             self.update_a_table()
     
     def update_a_table(self):
@@ -1827,6 +1955,8 @@ class OCRImageMatcher(QMainWindow):
                 text = f"[已匹配 {int(similarity*100)}%]\n{text}" if text else f"[已匹配 {int(similarity*100)}%]"
             
             card.update_text(text)
+            w, h = info.get("width", 0) or 0, info.get("height", 0) or 0
+            card.update_size(w, h)
 
             # 同步更新卡片标题显示的名称（使用 new_name）
             display_name = info.get('new_name', os.path.basename(img_path))
@@ -1947,9 +2077,19 @@ class OCRImageMatcher(QMainWindow):
                 # 根据当前 A 文本计算 B 组相似度候选
                 self.compute_b_suggestions_for_current_a()
         
-        self.update_buttons_state()
-        self.update_connection_line()
-        # A 组焦点变化后，刷新 B 组排序（将候选置顶）
+        self._on_selection_changed()
+        # A 组焦点变化后，防抖刷新 B 组排序
+        if self._pending_update_b_timer:
+            self._pending_update_b_timer.stop()
+        self._pending_update_b_timer = QTimer(self)
+        self._pending_update_b_timer.setSingleShot(True)
+        self._pending_update_b_timer.timeout.connect(self._debounced_update_b_table)
+        self._pending_update_b_timer.start(80)
+
+    def _debounced_update_b_table(self):
+        """防抖后的 B 表刷新"""
+        if self._pending_update_b_timer:
+            self._pending_update_b_timer = None
         self.update_b_table()
 
     def compute_b_suggestions_for_current_a(self):
@@ -1998,11 +2138,13 @@ class OCRImageMatcher(QMainWindow):
                 self.selected_b_card = self.b_cards[img_path]
                 self.selected_b_card.set_selected(True)
         
+        self._on_selection_changed()
+
+    def _on_selection_changed(self):
+        """选中状态变化时统一刷新：按钮、匹配度显示、配对日志"""
         self.update_buttons_state()
         self.update_connection_line()
-        # 选中 A/B 变更时，刷新底部文本对比
-        self.update_diff_view()
-    
+
     def on_a_card_delete(self, img_path: str):
         """删除A组中的一张图片"""
         if img_path in self.group_a_images:
@@ -2195,19 +2337,11 @@ class OCRImageMatcher(QMainWindow):
             self.start_ocr_b()
     
     def update_connection_line(self):
-        """更新对比连线效果（在手动配对时显示）"""
-        # 这个功能需要自定义绘制，暂时用日志提示
-        a_selected = self.selected_a_card is not None
-        b_selected = self.selected_b_card is not None
-        
-        if a_selected and b_selected:
+        """选中 A+B 各一张时记录日志，便于手动配对"""
+        if self.selected_a_card and self.selected_b_card:
             a_name = os.path.basename(self.selected_a_card.img_path)
             b_name = os.path.basename(self.selected_b_card.img_path)
             self.log(f"准备配对: A组 [{a_name}] ↔ B组 [{b_name}]")
-            # 实际的可视化连线需要自定义Widget和paintEvent实现
-
-        # 每次选中变化时也更新底部文本对比
-        self.update_diff_view()
     
     def update_buttons_state(self):
         """更新按钮状态"""
@@ -2216,10 +2350,11 @@ class OCRImageMatcher(QMainWindow):
         # 自动匹配改为手动触发：当 A/B 都有 OCR 结果时才允许点击
         self.auto_match_btn.setEnabled(has_a and has_b)
         
-        # 手动配对：需要左右各选一项
+        # 手动配对：需要左右各选一项，并更新匹配度显示
         a_selected = self.selected_a_card is not None
         b_selected = self.selected_b_card is not None
         self.manual_match_btn.setEnabled(a_selected and b_selected)
+        self._update_pair_similarity_label()
 
         # 批量重命名：当存在至少一条匹配关系时启用（matched=True）
         any_matched = any(
@@ -2258,19 +2393,9 @@ class OCRImageMatcher(QMainWindow):
         self.b_filter_mode = mode
         self.update_b_table()
     
-    def auto_match_and_rename(self):
-        """自动匹配并立即执行真实重命名"""
-        if not self.group_a_texts or not self.group_b_texts:
-            QMessageBox.warning(self, "警告", "请先完成A组和B组的OCR识别！")
-            return
-        # 减少日志与 UI 抖动，避免大批量匹配时产生明显卡顿
-        self.log("开始自动匹配并重命名文件...")
-        self.auto_match_btn.setEnabled(False)  # 防止重复点击
-        
+    def run_matching_logic(self):
+        """执行匹配逻辑（仅计算匹配关系，不执行重命名）"""
         used_a_matches = set()
-        success_count = 0
-        warning_count = 0
-        
         for b_path in self.group_b_images:
             b_info = self.group_b_info.get(b_path, {})
             if b_info.get('matched', False):
@@ -2283,11 +2408,10 @@ class OCRImageMatcher(QMainWindow):
             best_match_a_path = None
             best_similarity = 0
 
-            # B组尺寸（用于尺寸限制）
-            b_width = b_info.get('width', 0)
-            b_height = b_info.get('height', 0)
-            
-            # 在A组中寻找最佳匹配
+            # OCR 相似度达标 + 尺寸比例（宽高比）一致
+            b_info_data = self.group_b_info.get(b_path, {})
+            b_w, b_h = b_info_data.get('width', 0) or 0, b_info_data.get('height', 0) or 0
+
             for a_path in self.group_a_images:
                 if a_path in used_a_matches:
                     continue
@@ -2296,16 +2420,16 @@ class OCRImageMatcher(QMainWindow):
                 if not a_text or not a_text.strip():
                     continue
 
-                # 尺寸限制：默认只匹配尺寸相同的图片；如果勾选“忽略尺寸限制”，则跳过此判断
+                # 尺寸比例一致：宽高比相同（允许约 5% 误差，兼容缩放图）
                 a_info = self.group_a_info.get(a_path, {})
-                a_width = a_info.get('width', 0)
-                a_height = a_info.get('height', 0)
-                if not self.ignore_size_limit:
-                    if a_width and a_height and b_width and b_height:
-                        if a_width != b_width or a_height != b_height:
-                            continue
-                
-                # 计算相似度
+                a_w, a_h = a_info.get('width', 0) or 0, a_info.get('height', 0) or 0
+                if a_w and a_h and b_w and b_h:
+                    a_ratio = a_w / a_h
+                    b_ratio = b_w / b_h
+                    if abs(a_ratio - b_ratio) / max(a_ratio, b_ratio, 0.001) > 0.05:
+                        continue
+
+                # 计算文本相似度
                 if FUZZYWUZZY_AVAILABLE:
                     similarity = fuzz.ratio(a_text, b_text) / 100.0
                 else:
@@ -2339,20 +2463,20 @@ class OCRImageMatcher(QMainWindow):
 
                 used_a_matches.add(best_match_a_path)
 
-                # 根据相似度输出不同提示，但都视为“已匹配”，方便这类相似文本自动对上
-                if best_similarity >= self.threshold + 0.05:
-                    success_count += 1
-                else:
-                    warning_count += 1
-        
-        self.log(f"自动匹配完成！候选成功: {success_count} 张，需核对: {warning_count} 张")
-        
-        # 更新卡片，展示匹配结果
+    def auto_match_and_rename(self):
+        """自动匹配并立即执行真实重命名"""
+        if not self.group_a_texts or not self.group_b_texts:
+            QMessageBox.warning(self, "警告", "请先完成A组和B组的OCR识别！")
+            return
+        self.log("开始自动匹配并重命名文件...")
+        self.auto_match_btn.setEnabled(False)
+        self.run_matching_logic()
         self.update_a_table()
         self.update_b_table()
         self.auto_match_btn.setEnabled(True)
-        # 自动对全部已匹配项执行真实重命名
         self.apply_matched_renames()
+        matched_count = sum(1 for info in self.group_b_info.values() if info.get("matched"))
+        self.log(f"自动匹配完成！已匹配 {matched_count} 张")
 
     def apply_matched_renames(self):
         """对已匹配的B组图片批量执行真实重命名"""
@@ -2693,9 +2817,22 @@ class OCRImageMatcher(QMainWindow):
             self.log(f"✗ 手动配对失败: {e}")
 
     def resizeEvent(self, event):
-        """窗口尺寸改变时，重新布局网格，避免图片卡片之间空白过大"""
+        """窗口尺寸改变时，防抖后重排网格，避免频繁重绘"""
         super().resizeEvent(event)
-        # 根据最新宽度重排 A/B 组卡片
+        if getattr(self, "_resize_debounce_timer", None):
+            try:
+                self._resize_debounce_timer.stop()
+            except Exception:
+                pass
+        self._resize_debounce_timer = QTimer(self)
+        self._resize_debounce_timer.setSingleShot(True)
+        self._resize_debounce_timer.timeout.connect(self._on_resize_debounced)
+        self._resize_debounce_timer.start(150)
+
+    def _on_resize_debounced(self):
+        """防抖后的网格重排"""
+        if hasattr(self, "_resize_debounce_timer"):
+            self._resize_debounce_timer = None
         self.update_a_table()
         self.update_b_table()
 
