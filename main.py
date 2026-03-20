@@ -1250,6 +1250,27 @@ class OCRImageMatcher(QMainWindow):
         self.clear_b_btn.setStyleSheet(btn_style)
         self.clear_b_btn.clicked.connect(self.clear_b_images)
         center_vbox.addWidget(self.clear_b_btn)
+        
+        self.delete_unmatched_b_btn = QPushButton("🗑 删除未匹配B组文件")
+        self.delete_unmatched_b_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FFFFFF;
+                color: #A80000;
+                border: 1px solid #A80000;
+                border-radius: 8px;
+                padding: 10px 18px;
+                font-size: 13px;
+                font-weight: bold;
+                min-height: 44px;
+                min-width: 160px;
+            }
+            QPushButton:hover { background-color: #f3f2f1; }
+            QPushButton:pressed { background-color: #e1dfdd; padding-top: 11px; padding-left: 19px; }
+            QPushButton:disabled { color: #A19F9D; border-color: #C8C6C4; }
+        """)
+        self.delete_unmatched_b_btn.clicked.connect(self.delete_unmatched_b_files)
+        self.delete_unmatched_b_btn.setEnabled(False)
+        center_vbox.addWidget(self.delete_unmatched_b_btn)
         # 选中两张图时显示匹配度
         self.pair_similarity_label = QLabel("请选择 A 组和 B 组各一张图片")
         self.pair_similarity_label.setStyleSheet("color: #605E5C; font-size: 11px; padding: 4px 0;")
@@ -1278,7 +1299,7 @@ class OCRImageMatcher(QMainWindow):
         center_vbox.addStretch(1)  # 底部弹性空间，与顶部对称实现垂直居中
 
         # 按钮宽度适应 240px 中间区
-        for btn in (self.clear_all_btn, self.clear_b_btn, self.manual_match_btn):
+        for btn in (self.clear_all_btn, self.clear_b_btn, self.delete_unmatched_b_btn, self.manual_match_btn):
             btn.setMaximumWidth(216)
 
         # 隐藏按钮（供程序内部调用）
@@ -2363,6 +2384,13 @@ class OCRImageMatcher(QMainWindow):
         )
         self.apply_rename_btn.setEnabled(any_matched)
 
+        # 删除未匹配B组文件：只要存在 matched=False 的 B 图片即可启用
+        has_unmatched_b = any(
+            not self.group_b_info.get(p, {}).get('matched', False)
+            for p in self.group_b_images
+        )
+        self.delete_unmatched_b_btn.setEnabled(has_unmatched_b)
+
         # 同步更新顶部匹配进度概览
         self.update_summary()
 
@@ -2874,6 +2902,55 @@ class OCRImageMatcher(QMainWindow):
         self.update_buttons_state()
 
         self.log("已清空 B 组图片与匹配结果。")
+
+    def delete_unmatched_b_files(self):
+        """删除B组中未匹配成功（matched=False）的图片文件（同时移除界面数据）"""
+        # 避免删除过程中 OCR/尺寸读取还在访问文件
+        if (self.worker_b and self.worker_b.isRunning()) or (self.size_worker and self.size_worker.isRunning()):
+            QMessageBox.warning(self, "警告", "识别/读取进行中，请稍后再删除未匹配文件。")
+            return
+
+        unmatched_paths = [
+            p for p in self.group_b_images
+            if not self.group_b_info.get(p, {}).get("matched", False)
+        ]
+        if not unmatched_paths:
+            QMessageBox.information(self, "提示", "当前没有未匹配的B组文件。")
+            return
+
+        delete_ok = 0
+        delete_failed: List[str] = []
+
+        # 先从磁盘尝试删除；无论成功与否，都移除界面数据，避免再次触发匹配
+        for p in unmatched_paths:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    delete_ok += 1
+                except Exception as e:
+                    delete_failed.append(f"{os.path.basename(p)}: {e}")
+
+            # 移除界面/数据结构中的引用
+            if p in self.group_b_images:
+                self.group_b_images.remove(p)
+            self.group_b_texts.pop(p, None)
+            self.group_b_info.pop(p, None)
+            self.b_suggestions.pop(p, None)
+
+            if self.selected_b_card and self.selected_b_card.img_path == p:
+                self.selected_b_card = None
+
+        # 直接重建卡片网格
+        self.update_b_table()
+        self.update_buttons_state()
+
+        self.log(f"已删除未匹配B组文件：{delete_ok}/{len(unmatched_paths)}")
+        if delete_failed:
+            QMessageBox.warning(
+                self,
+                "删除失败",
+                "部分文件删除失败（最多显示20条）：\n\n" + "\n".join(delete_failed[:20])
+            )
 
     def clear_all_images(self):
         """清空A/B两组已上传的图片与匹配结果，恢复到初始状态"""
