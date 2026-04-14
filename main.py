@@ -834,6 +834,9 @@ class OCRImageMatcher(QMainWindow):
         self.batch_current_index: int = -1
         self.batch_selected_index: int = -1
         self.batch_results: Dict[str, Dict[str, object]] = {}
+        self._updating_batch_summary: bool = False
+        self._switching_batch_group: bool = False
+        self._pending_b_table_refresh_timer: Optional[QTimer] = None
 
         # OCR引擎
         self.ocr_controller = None
@@ -1425,7 +1428,7 @@ class OCRImageMatcher(QMainWindow):
         """)
         self.batch_summary_list.setMinimumHeight(140)
         self.batch_summary_list.setMaximumHeight(180)
-        self.batch_summary_list.itemClicked.connect(self.on_batch_summary_item_clicked)
+        self.batch_summary_list.currentRowChanged.connect(self.on_batch_summary_row_changed)
         self.batch_summary_list.setVisible(False)
         center_vbox.addWidget(self.batch_summary_list)
         center_vbox.addStretch(1)  # 底部弹性空间，与顶部对称实现垂直居中
@@ -1644,9 +1647,7 @@ class OCRImageMatcher(QMainWindow):
         """异步读取图片尺寸并更新 UI"""
         if not image_paths:
             return
-        if self.size_worker and self.size_worker.isRunning():
-            self.size_worker.requestInterruption()
-            self.size_worker.wait(500)
+        self._stop_worker_thread("size_worker", timeout_ms=800)
         self.size_worker = ImageSizeWorker(image_paths)
         self.size_worker.size_ready.connect(lambda p, w, h, g=group: self.on_image_size_ready(p, w, h, g))
         self.size_worker.start()
@@ -1816,6 +1817,7 @@ class OCRImageMatcher(QMainWindow):
         self.a_select_files_btn.setEnabled(False)
         self.a_select_folder_btn.setEnabled(False)
         
+        self._stop_worker_thread("worker_a", timeout_ms=1200)
         self.worker_a = OCRWorker(self.ocr_controller, self.group_a_images, "A组")
         self.worker_a.progress.connect(self.on_ocr_a_progress)
         self.worker_a.finished.connect(self.on_ocr_a_finished)
@@ -1830,6 +1832,7 @@ class OCRImageMatcher(QMainWindow):
         self.a_select_files_btn.setEnabled(False)
         self.a_select_folder_btn.setEnabled(False)
         
+        self._stop_worker_thread("worker_a", timeout_ms=1200)
         self.worker_a = OCRWorker(self.ocr_controller, image_files, "A组")
         self.worker_a.progress.connect(self.on_ocr_a_progress)
         self.worker_a.finished.connect(self.on_ocr_a_finished)
@@ -1844,6 +1847,7 @@ class OCRImageMatcher(QMainWindow):
         self.b_select_files_btn.setEnabled(False)
         self.b_select_folder_btn.setEnabled(False)
         
+        self._stop_worker_thread("worker_b", timeout_ms=1200)
         self.worker_b = OCRWorker(self.ocr_controller, self.group_b_images, "B组")
         self.worker_b.progress.connect(self.on_ocr_b_progress)
         self.worker_b.finished.connect(self.on_ocr_b_finished)
@@ -1858,6 +1862,7 @@ class OCRImageMatcher(QMainWindow):
         self.b_select_files_btn.setEnabled(False)
         self.b_select_folder_btn.setEnabled(False)
         
+        self._stop_worker_thread("worker_b", timeout_ms=1200)
         self.worker_b = OCRWorker(self.ocr_controller, image_files, "B组")
         self.worker_b.progress.connect(self.on_ocr_b_progress)
         self.worker_b.finished.connect(self.on_ocr_b_finished)
@@ -1948,27 +1953,52 @@ class OCRImageMatcher(QMainWindow):
                     if 'original_name' not in self.group_b_info[img_path]:
                         self.group_b_info[img_path]['original_name'] = os.path.basename(img_path)
             
-            # 实时更新卡片
-            self.update_b_card(img_path)
+            # 批处理中避免高频重建卡片导致卡顿/重入，改为防抖整体刷新
+            if self.batch_mode_enabled:
+                self._schedule_b_table_refresh()
+            else:
+                # 单组模式保留实时单卡更新
+                self.update_b_card(img_path)
+
+    def _schedule_b_table_refresh(self):
+        """防抖刷新B组表格，降低批处理阶段的UI更新压力。"""
+        if getattr(self, "_pending_b_table_refresh_timer", None):
+            try:
+                self._pending_b_table_refresh_timer.stop()
+            except Exception:
+                pass
+        self._pending_b_table_refresh_timer = QTimer(self)
+        self._pending_b_table_refresh_timer.setSingleShot(True)
+        self._pending_b_table_refresh_timer.timeout.connect(self._flush_b_table_refresh)
+        self._pending_b_table_refresh_timer.start(120)
+
+    def _flush_b_table_refresh(self):
+        """执行防抖后的B组刷新。"""
+        try:
+            self.update_b_table()
+            self.update_buttons_state()
+        except Exception as e:
+            self.log(f"[刷新异常] B组界面刷新失败: {e}")
     
     def on_ocr_b_finished(self):
         """B组OCR完成"""
-        self.log("B组识别完成！")
-        self.b_select_files_btn.setEnabled(True)
-        self.b_select_folder_btn.setEnabled(True)
-        
-        # 保存到缓存
-        if self.group_b_folder:
-            self.ocr_cache[self.group_b_folder] = self.group_b_texts.copy()
-        
-        # 更新按钮状态
-        self.update_buttons_state()
-        # A/B 任意一侧识别完成后，如两侧都有文本则自动匹配
         try:
+            self.log("B组识别完成！")
+            self.b_select_files_btn.setEnabled(True)
+            self.b_select_folder_btn.setEnabled(True)
+            
+            # 保存到缓存
+            if self.group_b_folder:
+                self.ocr_cache[self.group_b_folder] = self.group_b_texts.copy()
+            
+            # 更新按钮状态
+            self.update_buttons_state()
+            # A/B 任意一侧识别完成后，如两侧都有文本则自动触发匹配
             self.trigger_auto_match_if_ready()
             if self.batch_mode_enabled:
                 self.finalize_batch_task(success=True)
         except Exception as e:
+            self.log(f"[OCR完成异常] B组收尾失败: {e}")
             if self.batch_mode_enabled:
                 self.finalize_batch_task(success=False, error=str(e))
 
@@ -2489,35 +2519,39 @@ class OCRImageMatcher(QMainWindow):
         if not self.batch_mode_enabled:
             return
 
-        next_index = -1
-        for idx, task in enumerate(self.batch_tasks):
-            if task.get("status") == "pending":
-                next_index = idx
-                break
+        try:
+            next_index = -1
+            for idx, task in enumerate(self.batch_tasks):
+                if task.get("status") == "pending":
+                    next_index = idx
+                    break
 
-        if next_index < 0:
-            self.finish_batch_process()
-            return
+            if next_index < 0:
+                self.finish_batch_process()
+                return
 
-        self.batch_current_index = next_index
-        self.batch_selected_index = next_index
-        current_task = self.batch_tasks[next_index]
-        current_task["status"] = "running"
-        self.update_batch_summary()
+            self.batch_current_index = next_index
+            self.batch_selected_index = next_index
+            current_task = self.batch_tasks[next_index]
+            current_task["status"] = "running"
+            self.update_batch_summary()
 
-        folder = str(current_task.get("b_folder", ""))
-        self.log(f"[批处理 {next_index+1}/{len(self.batch_tasks)}] 处理中：{os.path.basename(folder)}")
+            folder = str(current_task.get("b_folder", ""))
+            self.log(f"[批处理 {next_index+1}/{len(self.batch_tasks)}] 处理中：{os.path.basename(folder)}")
 
-        had_cache = folder in self.ocr_cache
-        self.select_folder_b_internal(folder)
+            had_cache = folder in self.ocr_cache
+            self.select_folder_b_internal(folder)
 
-        # 命中缓存时不会触发 OCR 完成回调，需要在此处直接推进流程
-        if had_cache:
-            try:
-                self.trigger_auto_match_if_ready()
-                self.finalize_batch_task(success=True)
-            except Exception as e:
-                self.finalize_batch_task(success=False, error=str(e))
+            # 命中缓存时不会触发 OCR 完成回调，需要在此处直接推进流程
+            if had_cache:
+                try:
+                    self.trigger_auto_match_if_ready()
+                    self.finalize_batch_task(success=True)
+                except Exception as e:
+                    self.finalize_batch_task(success=False, error=str(e))
+        except Exception as e:
+            self.log(f"[批处理异常] 处理下一组失败: {e}")
+            self.finalize_batch_task(success=False, error=str(e))
 
     def finalize_batch_task(self, success: bool, error: str = ""):
         """收尾当前任务并推进下一组"""
@@ -2567,48 +2601,51 @@ class OCRImageMatcher(QMainWindow):
         """刷新批处理总览列表"""
         if not hasattr(self, "batch_summary_list"):
             return
+        if self._updating_batch_summary:
+            return
+        self._updating_batch_summary = True
+        self.batch_summary_list.blockSignals(True)
         self.batch_summary_list.clear()
 
-        for idx, task in enumerate(self.batch_tasks):
-            folder = str(task.get("b_folder", ""))
-            status = str(task.get("status", "pending"))
-            matched_count = int(task.get("matched_count", 0) or 0)
-            # 总览比例改为：B组已匹配 / A组总数
-            a_total_count = len(self.group_a_images)
-            if status == "running":
-                status_text = "处理中"
-            elif status == "done":
-                status_text = "已完成"
-            elif status == "failed":
-                status_text = "失败"
+        try:
+            for idx, task in enumerate(self.batch_tasks):
+                folder = str(task.get("b_folder", ""))
+                status = str(task.get("status", "pending"))
+                matched_count = int(task.get("matched_count", 0) or 0)
+                # 总览比例改为：B组已匹配 / A组总数
+                a_total_count = len(self.group_a_images)
+                if status == "running":
+                    status_text = "处理中"
+                elif status == "done":
+                    status_text = "已完成"
+                elif status == "failed":
+                    status_text = "失败"
+                else:
+                    status_text = "待处理"
+
+                item_text = f"{idx+1}. {os.path.basename(folder)} | {status_text} | {matched_count}/{a_total_count}"
+                self.batch_summary_list.addItem(item_text)
+
+            if self.batch_tasks:
+                self.batch_summary_title.setVisible(True)
+                self.batch_summary_list.setVisible(True)
+                highlight_index = self.batch_selected_index
+                if highlight_index < 0:
+                    highlight_index = self.batch_current_index
+                if highlight_index >= 0 and highlight_index < self.batch_summary_list.count():
+                    self.batch_summary_list.setCurrentRow(highlight_index)
             else:
-                status_text = "待处理"
+                self.batch_selected_index = -1
+                self.batch_summary_title.setVisible(False)
+                self.batch_summary_list.setVisible(False)
+        finally:
+            self.batch_summary_list.blockSignals(False)
+            self._updating_batch_summary = False
 
-            item_text = f"{idx+1}. {os.path.basename(folder)} | {status_text} | {matched_count}/{a_total_count}"
-            self.batch_summary_list.addItem(item_text)
-
-        if self.batch_tasks:
-            self.batch_summary_title.setVisible(True)
-            self.batch_summary_list.setVisible(True)
-            highlight_index = self.batch_selected_index
-            if highlight_index < 0:
-                highlight_index = self.batch_current_index
-            if highlight_index >= 0 and highlight_index < self.batch_summary_list.count():
-                self.batch_summary_list.setCurrentRow(highlight_index)
-        else:
-            self.batch_selected_index = -1
-            self.batch_summary_title.setVisible(False)
-            self.batch_summary_list.setVisible(False)
-
-    def on_batch_summary_item_clicked(self, item=None):
-        """点击总览中的某组，切换到该组明细展示"""
-        # 优先使用当前行，避免 item 在列表刷新后被销毁导致 RuntimeError
-        row = self.batch_summary_list.currentRow()
-        if row < 0 and item is not None:
-            try:
-                row = self.batch_summary_list.row(item)
-            except RuntimeError:
-                return
+    def on_batch_summary_row_changed(self, row: int):
+        """批处理总览当前行变化时切换到对应分组。"""
+        if self._updating_batch_summary or self._switching_batch_group:
+            return
         if row < 0 or row >= len(self.batch_tasks):
             return
         self.batch_selected_index = row
@@ -2645,23 +2682,29 @@ class OCRImageMatcher(QMainWindow):
 
     def _switch_to_batch_index(self, index: int) -> bool:
         """按索引切换批处理分组（用于自动切换），成功返回 True。"""
+        if self._switching_batch_group:
+            return False
         if index < 0 or index >= len(self.batch_tasks):
             return False
-        self.batch_selected_index = index
-        self.batch_summary_list.setCurrentRow(index)
-        task = self.batch_tasks[index]
-        snapshot = task.get("snapshot")
-        if snapshot:
-            self._restore_b_snapshot(snapshot)
-            self.log(f"已切换到批处理明细：{os.path.basename(str(task.get('b_folder', '')))}")
-            return True
-        folder = str(task.get("b_folder", ""))
-        if folder and os.path.isdir(folder):
-            self.select_folder_b_internal(folder)
-            self._sync_current_folder_batch_snapshot()
-            self.log(f"已加载分组明细：{os.path.basename(folder)}")
-            return True
-        return False
+        self._switching_batch_group = True
+        try:
+            self.batch_selected_index = index
+            self.batch_summary_list.setCurrentRow(index)
+            task = self.batch_tasks[index]
+            snapshot = task.get("snapshot")
+            if snapshot:
+                self._restore_b_snapshot(snapshot)
+                self.log(f"已切换到批处理明细：{os.path.basename(str(task.get('b_folder', '')))}")
+                return True
+            folder = str(task.get("b_folder", ""))
+            if folder and os.path.isdir(folder):
+                self.select_folder_b_internal(folder)
+                self._sync_current_folder_batch_snapshot()
+                self.log(f"已加载分组明细：{os.path.basename(folder)}")
+                return True
+            return False
+        finally:
+            self._switching_batch_group = False
 
     def _make_current_b_snapshot(self) -> Dict[str, object]:
         """记录当前B组状态快照，供总览点击后恢复明细"""
@@ -2739,6 +2782,19 @@ class OCRImageMatcher(QMainWindow):
             self.batch_results[folder]["total_count"] = task["total_count"]
             self.batch_results[folder]["matched_count"] = task["matched_count"]
         self.update_batch_summary()
+
+    def _stop_worker_thread(self, attr_name: str, timeout_ms: int = 1500):
+        """安全停止并回收指定QThread属性，避免线程对象被提前销毁。"""
+        worker = getattr(self, attr_name, None)
+        if not worker:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+                worker.wait(timeout_ms)
+        except Exception:
+            pass
+        setattr(self, attr_name, None)
     
     def select_folder_a_internal(self, folder: str):
         """内部方法：选择A组文件夹"""
@@ -3517,24 +3573,29 @@ class OCRImageMatcher(QMainWindow):
 
     def closeEvent(self, event):
         """窗口关闭事件：先优雅停止后台线程和OCR进程，避免闪退"""
-        # 1. 请求并等待 OCR 工作线程安全退出，防止 "QThread: Destroyed while thread is still running"
-        for worker in (self.worker_a, self.worker_b):
-            try:
-                if worker and worker.isRunning():
-                    worker.requestInterruption()
-                    # 最长等待3秒结束当前图片识别
-                    worker.wait(3000)
-            except Exception as e:
-                print(f"[关闭] 停止OCR线程时出错: {e}")
+        # 1. 停止界面防抖计时器，避免关闭中再次触发UI更新
+        for timer_attr in ("_pending_update_b_timer", "_threshold_timer", "_resize_debounce_timer", "_pending_b_table_refresh_timer"):
+            timer = getattr(self, timer_attr, None)
+            if timer:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+                setattr(self, timer_attr, None)
 
-        # 2. 停止 OCR 引擎子进程
+        # 2. 请求并等待所有工作线程安全退出，防止 QThread 销毁时仍在运行
+        self._stop_worker_thread("worker_a", timeout_ms=3000)
+        self._stop_worker_thread("worker_b", timeout_ms=3000)
+        self._stop_worker_thread("size_worker", timeout_ms=2000)
+
+        # 3. 停止 OCR 引擎子进程
         if self.ocr_controller:
             self.ocr_controller.stop()
 
-        # 3. 清理 AVIF/HEIC 转换缓存文件
+        # 4. 清理 AVIF/HEIC 转换缓存文件
         clear_image_conversion_cache()
 
-        # 4. 正常关闭窗口
+        # 5. 正常关闭窗口
         event.accept()
 
 
