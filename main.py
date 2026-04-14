@@ -14,6 +14,7 @@ import sys
 import time
 import tempfile
 import hashlib
+import copy
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from PIL import Image
@@ -827,6 +828,13 @@ class OCRImageMatcher(QMainWindow):
         self._threshold_timer: Optional[QTimer] = None
         self._resize_debounce_timer: Optional[QTimer] = None
 
+        # 多文件夹批处理状态（单A -> 多B）
+        self.batch_mode_enabled: bool = False
+        self.batch_tasks: List[Dict[str, object]] = []
+        self.batch_current_index: int = -1
+        self.batch_selected_index: int = -1
+        self.batch_results: Dict[str, Dict[str, object]] = {}
+
         # OCR引擎
         self.ocr_controller = None
         self.exe_path = self.find_paddleocr_exe()
@@ -1391,6 +1399,35 @@ class OCRImageMatcher(QMainWindow):
         self.manual_match_btn.clicked.connect(self.manual_match)
         self.manual_match_btn.setEnabled(False)
         center_vbox.addWidget(self.manual_match_btn)
+
+        # 批处理总览（默认隐藏，仅多文件夹模式显示）
+        self.batch_summary_title = QLabel("批处理总览")
+        self.batch_summary_title.setStyleSheet("color: #323130; font-size: 12px; font-weight: bold; padding-top: 4px;")
+        self.batch_summary_title.setAlignment(Qt.AlignCenter)
+        self.batch_summary_title.setVisible(False)
+        center_vbox.addWidget(self.batch_summary_title)
+
+        self.batch_summary_list = QListWidget()
+        self.batch_summary_list.setStyleSheet("""
+            QListWidget {
+                background-color: #FFFFFF;
+                border: 1px solid #D1D1D1;
+                border-radius: 6px;
+                font-size: 11px;
+            }
+            QListWidget::item {
+                padding: 4px 6px;
+            }
+            QListWidget::item:selected {
+                background-color: #DEECF9;
+                color: #0F548C;
+            }
+        """)
+        self.batch_summary_list.setMinimumHeight(140)
+        self.batch_summary_list.setMaximumHeight(180)
+        self.batch_summary_list.itemClicked.connect(self.on_batch_summary_item_clicked)
+        self.batch_summary_list.setVisible(False)
+        center_vbox.addWidget(self.batch_summary_list)
         center_vbox.addStretch(1)  # 底部弹性空间，与顶部对称实现垂直居中
 
         # 按钮宽度适应 240px 中间区
@@ -1927,7 +1964,13 @@ class OCRImageMatcher(QMainWindow):
         # 更新按钮状态
         self.update_buttons_state()
         # A/B 任意一侧识别完成后，如两侧都有文本则自动匹配
-        self.trigger_auto_match_if_ready()
+        try:
+            self.trigger_auto_match_if_ready()
+            if self.batch_mode_enabled:
+                self.finalize_batch_task(success=True)
+        except Exception as e:
+            if self.batch_mode_enabled:
+                self.finalize_batch_task(success=False, error=str(e))
 
     def trigger_auto_match_if_ready(self):
         """当 A/B 组都有 OCR 文本时自动触发匹配"""
@@ -2288,6 +2331,7 @@ class OCRImageMatcher(QMainWindow):
         # 重建网格，避免留下空洞
         self.update_b_table()
         self.update_buttons_state()
+        self._sync_current_folder_batch_snapshot()
         # B组有改动后重新尝试自动匹配
         self.trigger_auto_match_if_ready()
     
@@ -2387,11 +2431,314 @@ class OCRImageMatcher(QMainWindow):
         urls = event.mimeData().urls()
         if urls:
             file_paths = [url.toLocalFile() for url in urls]
+            folder_paths = []
+            for p in file_paths:
+                if os.path.isdir(p):
+                    abs_p = os.path.abspath(p)
+                    if abs_p not in folder_paths:
+                        folder_paths.append(abs_p)
+
+            # 多文件夹：进入“单A对多B”批处理模式
+            if len(folder_paths) > 1:
+                self.start_batch_process(folder_paths)
+                return
+
             image_files = self.filter_image_files(file_paths)
             if image_files:
                 self.add_images_to_group_b(image_files)
             else:
                 QMessageBox.warning(self, "警告", "拖拽的内容中没有找到有效的图片文件！")
+
+    def start_batch_process(self, b_folders: List[str]):
+        """启动多B文件夹串行批处理（单A对多B）"""
+        if self.batch_mode_enabled:
+            QMessageBox.warning(self, "警告", "批处理正在进行中，请等待当前任务完成。")
+            return
+        if not self.group_a_texts:
+            QMessageBox.warning(self, "警告", "请先准备并识别 A 组图片，再进行多文件夹批处理。")
+            return
+
+        valid_folders = [f for f in b_folders if os.path.isdir(f)]
+        if not valid_folders:
+            QMessageBox.warning(self, "警告", "未找到有效的文件夹。")
+            return
+
+        self.batch_mode_enabled = True
+        self.batch_current_index = -1
+        self.batch_selected_index = -1
+        self.batch_results = {}
+        self.batch_tasks = []
+        for folder in valid_folders:
+            self.batch_tasks.append({
+                "b_folder": folder,
+                "status": "pending",
+                "matched_count": 0,
+                "total_count": 0,
+                "error": "",
+                "snapshot": None,
+            })
+
+        self.batch_summary_title.setVisible(True)
+        self.batch_summary_list.setVisible(True)
+        self.update_batch_summary()
+        self.log(f"开始批处理：共 {len(self.batch_tasks)} 个B组文件夹。")
+        self.process_next_batch_task()
+
+    def process_next_batch_task(self):
+        """处理队列中的下一个B文件夹"""
+        if not self.batch_mode_enabled:
+            return
+
+        next_index = -1
+        for idx, task in enumerate(self.batch_tasks):
+            if task.get("status") == "pending":
+                next_index = idx
+                break
+
+        if next_index < 0:
+            self.finish_batch_process()
+            return
+
+        self.batch_current_index = next_index
+        self.batch_selected_index = next_index
+        current_task = self.batch_tasks[next_index]
+        current_task["status"] = "running"
+        self.update_batch_summary()
+
+        folder = str(current_task.get("b_folder", ""))
+        self.log(f"[批处理 {next_index+1}/{len(self.batch_tasks)}] 处理中：{os.path.basename(folder)}")
+
+        had_cache = folder in self.ocr_cache
+        self.select_folder_b_internal(folder)
+
+        # 命中缓存时不会触发 OCR 完成回调，需要在此处直接推进流程
+        if had_cache:
+            try:
+                self.trigger_auto_match_if_ready()
+                self.finalize_batch_task(success=True)
+            except Exception as e:
+                self.finalize_batch_task(success=False, error=str(e))
+
+    def finalize_batch_task(self, success: bool, error: str = ""):
+        """收尾当前任务并推进下一组"""
+        if not self.batch_mode_enabled:
+            return
+        if self.batch_current_index < 0 or self.batch_current_index >= len(self.batch_tasks):
+            return
+
+        task = self.batch_tasks[self.batch_current_index]
+        folder = str(task.get("b_folder", ""))
+        total_count = len(self.group_b_images)
+        matched_count = sum(1 for info in self.group_b_info.values() if info.get("matched", False))
+
+        task["total_count"] = total_count
+        task["matched_count"] = matched_count
+        task["error"] = error
+        task["status"] = "done" if success else "failed"
+        task["snapshot"] = self._make_current_b_snapshot()
+        self.batch_results[folder] = {
+            "status": task["status"],
+            "matched_count": matched_count,
+            "total_count": total_count,
+            "error": error,
+            "snapshot": task["snapshot"],
+        }
+        self.update_batch_summary()
+
+        if success:
+            self.log(f"[批处理完成] {os.path.basename(folder)}：匹配 {matched_count}/{total_count}")
+        else:
+            self.log(f"[批处理失败] {os.path.basename(folder)}：{error}")
+
+        QTimer.singleShot(0, self.process_next_batch_task)
+
+    def finish_batch_process(self):
+        """批处理队列全部完成"""
+        done = sum(1 for t in self.batch_tasks if t.get("status") == "done")
+        failed = sum(1 for t in self.batch_tasks if t.get("status") == "failed")
+        self.log(f"批处理结束：成功 {done} 组，失败 {failed} 组。")
+        self.batch_mode_enabled = False
+        self.batch_current_index = -1
+        if self.batch_selected_index < 0 and self.batch_tasks:
+            self.batch_selected_index = 0
+        self.update_batch_summary()
+
+    def update_batch_summary(self):
+        """刷新批处理总览列表"""
+        if not hasattr(self, "batch_summary_list"):
+            return
+        self.batch_summary_list.clear()
+
+        for idx, task in enumerate(self.batch_tasks):
+            folder = str(task.get("b_folder", ""))
+            status = str(task.get("status", "pending"))
+            matched_count = int(task.get("matched_count", 0) or 0)
+            # 总览比例改为：B组已匹配 / A组总数
+            a_total_count = len(self.group_a_images)
+            if status == "running":
+                status_text = "处理中"
+            elif status == "done":
+                status_text = "已完成"
+            elif status == "failed":
+                status_text = "失败"
+            else:
+                status_text = "待处理"
+
+            item_text = f"{idx+1}. {os.path.basename(folder)} | {status_text} | {matched_count}/{a_total_count}"
+            self.batch_summary_list.addItem(item_text)
+
+        if self.batch_tasks:
+            self.batch_summary_title.setVisible(True)
+            self.batch_summary_list.setVisible(True)
+            highlight_index = self.batch_selected_index
+            if highlight_index < 0:
+                highlight_index = self.batch_current_index
+            if highlight_index >= 0 and highlight_index < self.batch_summary_list.count():
+                self.batch_summary_list.setCurrentRow(highlight_index)
+        else:
+            self.batch_selected_index = -1
+            self.batch_summary_title.setVisible(False)
+            self.batch_summary_list.setVisible(False)
+
+    def on_batch_summary_item_clicked(self, item=None):
+        """点击总览中的某组，切换到该组明细展示"""
+        # 优先使用当前行，避免 item 在列表刷新后被销毁导致 RuntimeError
+        row = self.batch_summary_list.currentRow()
+        if row < 0 and item is not None:
+            try:
+                row = self.batch_summary_list.row(item)
+            except RuntimeError:
+                return
+        if row < 0 or row >= len(self.batch_tasks):
+            return
+        self.batch_selected_index = row
+        task = self.batch_tasks[row]
+        status = str(task.get("status", "pending"))
+
+        # 仅当“当前任务正在处理”时禁止切换，其他阶段允许查看已完成分组
+        current_running = False
+        if self.batch_mode_enabled:
+            if self.worker_b and self.worker_b.isRunning():
+                current_running = True
+            elif 0 <= self.batch_current_index < len(self.batch_tasks):
+                current_running = str(self.batch_tasks[self.batch_current_index].get("status", "")) == "running"
+        if current_running and status not in ("done", "failed"):
+            self.log("当前批处理仍在进行，请先等待该组完成后再切换。")
+            return
+
+        # 切换前先保存当前组最新状态，避免遗漏回写
+        self._sync_current_folder_batch_snapshot()
+
+        snapshot = task.get("snapshot")
+        if snapshot:
+            self._restore_b_snapshot(snapshot)
+            self.log(f"已切换到批处理明细：{os.path.basename(str(task.get('b_folder', '')))}")
+        else:
+            # 懒加载兜底：无快照时按文件夹重新加载，避免点击无效
+            folder = str(task.get("b_folder", ""))
+            if folder and os.path.isdir(folder):
+                self.select_folder_b_internal(folder)
+                self._sync_current_folder_batch_snapshot()
+                self.log(f"已加载分组明细：{os.path.basename(folder)}")
+            else:
+                self.log(f"该组尚无可展示快照：{os.path.basename(str(task.get('b_folder', '')))}")
+
+    def _switch_to_batch_index(self, index: int) -> bool:
+        """按索引切换批处理分组（用于自动切换），成功返回 True。"""
+        if index < 0 or index >= len(self.batch_tasks):
+            return False
+        self.batch_selected_index = index
+        self.batch_summary_list.setCurrentRow(index)
+        task = self.batch_tasks[index]
+        snapshot = task.get("snapshot")
+        if snapshot:
+            self._restore_b_snapshot(snapshot)
+            self.log(f"已切换到批处理明细：{os.path.basename(str(task.get('b_folder', '')))}")
+            return True
+        folder = str(task.get("b_folder", ""))
+        if folder and os.path.isdir(folder):
+            self.select_folder_b_internal(folder)
+            self._sync_current_folder_batch_snapshot()
+            self.log(f"已加载分组明细：{os.path.basename(folder)}")
+            return True
+        return False
+
+    def _make_current_b_snapshot(self) -> Dict[str, object]:
+        """记录当前B组状态快照，供总览点击后恢复明细"""
+        existing_images = [p for p in self.group_b_images if os.path.exists(p)]
+        existing_set = set(existing_images)
+        return {
+            "group_b_folder": self.group_b_folder,
+            "group_b_images": existing_images,
+            "group_b_texts": copy.deepcopy({k: v for k, v in self.group_b_texts.items() if k in existing_set}),
+            "group_b_info": copy.deepcopy({k: v for k, v in self.group_b_info.items() if k in existing_set}),
+        }
+
+    def _restore_b_snapshot(self, snapshot: Dict[str, object]):
+        """恢复某个B组快照到当前明细视图"""
+        self.group_b_folder = snapshot.get("group_b_folder")
+        if self.group_b_folder:
+            self.b_folder_label.setText(f"📁 {self.group_b_folder}")
+        raw_images = list(snapshot.get("group_b_images", []))
+        self.group_b_images = [p for p in raw_images if os.path.exists(p)]
+        valid_set = set(self.group_b_images)
+        raw_texts = copy.deepcopy(snapshot.get("group_b_texts", {}))
+        raw_info = copy.deepcopy(snapshot.get("group_b_info", {}))
+        self.group_b_texts = {k: v for k, v in raw_texts.items() if k in valid_set}
+        self.group_b_info = {k: v for k, v in raw_info.items() if k in valid_set}
+        self.selected_b_card = None
+        # 切换B组时，A组“已使用”状态必须按当前组重建，避免沿用上一组状态
+        self._refresh_a_used_from_current_b()
+        self.update_a_table()
+        self.update_b_table()
+        self.update_buttons_state()
+
+    def _refresh_a_used_from_current_b(self):
+        """根据当前B组匹配关系，重建A组 used 状态（每组独立）。"""
+        # 先全部重置
+        for a_path, a_info in list(self.group_a_info.items()):
+            if a_info.get("used"):
+                a_info["used"] = False
+                self.group_a_info[a_path] = a_info
+
+        # 再根据当前B组已匹配项回填
+        for b_info in self.group_b_info.values():
+            if not b_info.get("matched", False):
+                continue
+            a_path = b_info.get("matched_a_path")
+            if not a_path:
+                continue
+            if a_path in self.group_a_info:
+                a_info = self.group_a_info.get(a_path, {})
+                a_info["used"] = True
+                self.group_a_info[a_path] = a_info
+
+    def _sync_current_folder_batch_snapshot(self):
+        """当前B组发生手动改动后，同步更新批处理快照，避免切组回滚到旧数据。"""
+        if not self.group_b_folder or not self.batch_tasks:
+            return
+        target_index = -1
+        for idx, task in enumerate(self.batch_tasks):
+            if str(task.get("b_folder", "")) == str(self.group_b_folder):
+                target_index = idx
+                break
+        if target_index < 0:
+            return
+
+        snapshot = self._make_current_b_snapshot()
+        task = self.batch_tasks[target_index]
+        task["snapshot"] = snapshot
+        task["total_count"] = len(snapshot.get("group_b_images", []))
+        task["matched_count"] = sum(
+            1 for info in snapshot.get("group_b_info", {}).values()
+            if info.get("matched", False)
+        )
+        folder = str(task.get("b_folder", ""))
+        if folder in self.batch_results:
+            self.batch_results[folder]["snapshot"] = snapshot
+            self.batch_results[folder]["total_count"] = task["total_count"]
+            self.batch_results[folder]["matched_count"] = task["matched_count"]
+        self.update_batch_summary()
     
     def select_folder_a_internal(self, folder: str):
         """内部方法：选择A组文件夹"""
@@ -2732,6 +3079,7 @@ class OCRImageMatcher(QMainWindow):
         self.update_a_table()
         self.update_b_table()
         self.update_buttons_state()
+        self._sync_current_folder_batch_snapshot()
 
         # 不再弹出确认或完成对话框，仅在日志中提示结果，执行过程完全自动化
         self.log(f"批量重命名完成：成功 {success_count} 张，失败 {error_count} 张")
@@ -2931,10 +3279,43 @@ class OCRImageMatcher(QMainWindow):
                 if self.selected_b_card:
                     self.selected_b_card = None
                 self.update_buttons_state()
+                self._sync_current_folder_batch_snapshot()
 
                 self.log(f"✓ 手动配对成功: {os.path.basename(b_path)} → {new_name}")
             else:
-                self.log(f"跳过：{os.path.basename(b_path)}（名称相同）")
+                # 名称已相同：无需改名，但仍应视为成功配对，避免被“删除未匹配”误删
+                if b_path in self.group_b_info:
+                    b_info_same = self.group_b_info[b_path]
+                else:
+                    b_info_same = {}
+                if 'original_name' not in b_info_same:
+                    b_info_same['original_name'] = os.path.basename(b_path)
+                b_info_same['matched'] = True
+                b_info_same['matched_a_path'] = a_path
+                b_info_same['new_name'] = os.path.basename(b_path)
+                b_info_same['renamed'] = True
+                self.group_b_info[b_path] = b_info_same
+
+                # 标记对应A图已使用
+                a_info = self.group_a_info.get(a_path, {})
+                a_info['used'] = True
+                self.group_a_info[a_path] = a_info
+
+                # 保证一对一：释放其他占用同一A的B图
+                for other_b_path, other_info in list(self.group_b_info.items()):
+                    if other_b_path == b_path:
+                        continue
+                    if other_info.get('matched') and other_info.get('matched_a_path') == a_path:
+                        other_info['matched'] = False
+                        other_info['matched_a_path'] = None
+                        other_info['new_name'] = os.path.basename(other_b_path)
+                        self.group_b_info[other_b_path] = other_info
+
+                self.update_a_table()
+                self.update_b_table()
+                self.update_buttons_state()
+                self._sync_current_folder_batch_snapshot()
+                self.log(f"✓ 手动配对成功: {os.path.basename(b_path)} → {new_name}（名称相同，已标记匹配）")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"重命名失败：{e}")
             self.log(f"✗ 手动配对失败: {e}")
@@ -2960,7 +3341,10 @@ class OCRImageMatcher(QMainWindow):
         self.update_b_table()
 
     def clear_b_images(self):
-        """只清空B组图片与匹配结果，不影响A组"""
+        """只清空当前B组图片与匹配结果，不影响A组或其他分组"""
+        current_folder = self.group_b_folder
+        removed_batch_index = -1
+
         # 清空 B 组基础数据
         self.group_b_images = []
         self.group_b_texts = {}
@@ -2978,25 +3362,56 @@ class OCRImageMatcher(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
-        # 清理与当前 B 组文件夹相关的 OCR 缓存，并重置路径
-        if self.group_b_folder and self.group_b_folder in self.ocr_cache:
-            self.ocr_cache.pop(self.group_b_folder, None)
-        self.group_b_folder = None
+        # 清理当前 B 组的 OCR 缓存
+        if current_folder and current_folder in self.ocr_cache:
+            self.ocr_cache.pop(current_folder, None)
 
-        # 重置 B 组标签提示
-        self.b_folder_label.setText("未选择（支持拖拽图片或文件夹到此区域）")
+        # 仅清空当前组，不影响分组上下文
+        self.group_b_folder = current_folder
+        if current_folder:
+            self.b_folder_label.setText(f"📁 {current_folder}（已清空）")
+        else:
+            self.b_folder_label.setText("未选择（支持拖拽图片或文件夹到此区域）")
 
-        # 清空 B 组后，A 组的“已使用模板”状态也一并重置，方便下一轮匹配
-        for a_path, info in list(self.group_a_info.items()):
-            if info.get("used"):
-                info["used"] = False
-                self.group_a_info[a_path] = info
+        # A 组使用状态应基于“当前组”重建
+        self._refresh_a_used_from_current_b()
         self.update_a_table()
 
         # 更新按钮状态（没有 B 组时不能匹配 / 批量重命名）
         self.update_buttons_state()
+        # 若处于多组模式，仅更新当前组快照，不影响其他组
+        self._sync_current_folder_batch_snapshot()
 
-        self.log("已清空 B 组图片与匹配结果。")
+        # 批处理总览中移除该组，并自动切到下一组
+        if current_folder and self.batch_tasks:
+            for idx, task in enumerate(self.batch_tasks):
+                if str(task.get("b_folder", "")) == str(current_folder):
+                    removed_batch_index = idx
+                    break
+            if removed_batch_index >= 0:
+                self.batch_tasks.pop(removed_batch_index)
+                self.batch_results.pop(str(current_folder), None)
+                if self.batch_current_index == removed_batch_index:
+                    self.batch_current_index = -1
+                elif self.batch_current_index > removed_batch_index:
+                    self.batch_current_index -= 1
+
+                # 优先切换到“删除项后面的下一组”，若不存在则切到上一组
+                if self.batch_tasks:
+                    next_index = min(removed_batch_index, len(self.batch_tasks) - 1)
+                    self.batch_selected_index = next_index
+                else:
+                    self.batch_selected_index = -1
+                    self.group_b_folder = None
+                    self.b_folder_label.setText("未选择（支持拖拽图片或文件夹到此区域）")
+                    self.batch_mode_enabled = False
+                self.update_batch_summary()
+                if self.batch_tasks and self.batch_selected_index >= 0:
+                    self._switch_to_batch_index(self.batch_selected_index)
+                self.log("已清空并移除当前 B 组。")
+                return
+
+        self.log("已清空当前 B 组图片与匹配结果。")
 
     def delete_unmatched_b_files(self):
         """删除B组中未匹配成功（matched=False）的图片文件（同时移除界面数据）"""
@@ -3038,6 +3453,8 @@ class OCRImageMatcher(QMainWindow):
         # 直接重建卡片网格
         self.update_b_table()
         self.update_buttons_state()
+        # 批处理模式下，删除后需要同步当前组快照，避免切换时恢复到旧路径
+        self._sync_current_folder_batch_snapshot()
 
         self.log(f"已删除未匹配B组文件：{delete_ok}/{len(unmatched_paths)}")
         if delete_failed:
@@ -3049,6 +3466,13 @@ class OCRImageMatcher(QMainWindow):
 
     def clear_all_images(self):
         """清空A/B两组已上传的图片与匹配结果，恢复到初始状态"""
+        self.batch_mode_enabled = False
+        self.batch_current_index = -1
+        self.batch_selected_index = -1
+        self.batch_tasks = []
+        self.batch_results = {}
+        self.update_batch_summary()
+
         # 清空路径与基础数据
         self.group_a_folder = None
         self.group_b_folder = None
