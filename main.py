@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import tempfile
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from PIL import Image
@@ -68,6 +69,85 @@ except ImportError:
     print("警告：未安装 fuzzywuzzy，将使用 difflib 作为备选")
 
 
+# AVIF/HEIC 转换缓存：同一原图（按 path+mtime）仅转换一次，供 OCR 与缩略图复用
+_CONVERTED_IMAGE_CACHE: Dict[str, Dict[str, object]] = {}
+
+
+def get_cached_image_path(img_path: str) -> str:
+    """获取可直接读取的图片路径；对 AVIF/HEIC 做一次性缓存转换后复用。"""
+    abs_img_path = os.path.abspath(img_path)
+    ext = Path(abs_img_path).suffix.lower()
+    unsupported_formats = {".avif", ".heic", ".heif"}
+
+    if ext not in unsupported_formats:
+        return abs_img_path
+    if not os.path.exists(abs_img_path):
+        return abs_img_path
+
+    try:
+        mtime = os.path.getmtime(abs_img_path)
+    except Exception:
+        return abs_img_path
+
+    cache_item = _CONVERTED_IMAGE_CACHE.get(abs_img_path)
+    if cache_item:
+        cached_path = str(cache_item.get("cached_path", ""))
+        cached_mtime = cache_item.get("mtime")
+        if cached_mtime == mtime and cached_path and os.path.exists(cached_path):
+            return cached_path
+
+    cache_dir = os.path.join(tempfile.gettempdir(), "ocr_rename_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    file_hash = hashlib.md5(f"{abs_img_path}|{mtime}".encode("utf-8")).hexdigest()
+    jpg_path = os.path.join(cache_dir, f"{file_hash}.jpg")
+    webp_path = os.path.join(cache_dir, f"{file_hash}.webp")
+
+    try:
+        with Image.open(abs_img_path) as img:
+            if img.mode in ("RGBA", "LA", "P"):
+                rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+                if img.mode == "P":
+                    img = img.convert("RGBA")
+                rgb_img.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+                img = rgb_img
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            try:
+                img.save(jpg_path, "JPEG", quality=90, optimize=True)
+                cached_path = jpg_path
+            except Exception:
+                img.save(webp_path, "WEBP", quality=90, method=4)
+                cached_path = webp_path
+
+        old_cached = ""
+        if cache_item:
+            old_cached = str(cache_item.get("cached_path", ""))
+        if old_cached and old_cached != cached_path and os.path.exists(old_cached):
+            try:
+                os.remove(old_cached)
+            except Exception:
+                pass
+
+        _CONVERTED_IMAGE_CACHE[abs_img_path] = {"mtime": mtime, "cached_path": cached_path}
+        return cached_path
+    except Exception as e:
+        print(f"[格式转换失败] {os.path.basename(img_path)}: {e}")
+        return abs_img_path
+
+
+def clear_image_conversion_cache():
+    """清理运行期生成的转换缓存文件。"""
+    for item in list(_CONVERTED_IMAGE_CACHE.values()):
+        cached_path = str(item.get("cached_path", "")) if item else ""
+        if cached_path and os.path.exists(cached_path):
+            try:
+                os.remove(cached_path)
+            except Exception:
+                pass
+    _CONVERTED_IMAGE_CACHE.clear()
+
+
 class OCRController:
     """直接控制 OCR 引擎"""
     
@@ -120,34 +200,8 @@ class OCRController:
         print("[OCR初始化] 引擎就绪")
     
     def convert_image_if_needed(self, img_path):
-        """如果图片格式不支持，转换为PNG格式（临时文件）"""
-        abs_img_path = os.path.abspath(img_path)
-        ext = Path(abs_img_path).suffix.lower()
-        
-        unsupported_formats = {'.avif', '.heic', '.heif'}
-        
-        if ext in unsupported_formats:
-            try:
-                with Image.open(abs_img_path) as img:
-                    if img.mode in ('RGBA', 'LA', 'P'):
-                        rgb_img = Image.new('RGB', img.size, (255, 255, 255))
-                        if img.mode == 'P':
-                            img = img.convert('RGBA')
-                        rgb_img.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-                        img = rgb_img
-                    elif img.mode != 'RGB':
-                        img = img.convert('RGB')
-                    
-                    temp_name = f"ocr_temp_{os.path.basename(abs_img_path)}_{int(time.time())}.png"
-                    temp_path = os.path.join(tempfile.gettempdir(), temp_name)
-                    img.save(temp_path, 'PNG', quality=95)
-                    print(f"[格式转换] {ext} -> PNG: {os.path.basename(img_path)}")
-                    return temp_path
-            except Exception as e:
-                print(f"[格式转换失败] {os.path.basename(img_path)}: {e}")
-                return abs_img_path
-        
-        return abs_img_path
+        """返回 OCR 可直接读取的图片路径（含 AVIF/HEIC 缓存转换）。"""
+        return get_cached_image_path(img_path)
     
     def get_text(self, img_path):
         """识别图片并提取文本"""
@@ -159,7 +213,6 @@ class OCRController:
             return ""
         
         actual_img_path = self.convert_image_if_needed(abs_img_path)
-        is_temp_file = actual_img_path != abs_img_path
         
         try:
             writeDict = {"image_path": actual_img_path}
@@ -194,11 +247,8 @@ class OCRController:
             print(f"[OCR错误] 识别异常 {os.path.basename(img_path)}: {e}")
             return ""
         finally:
-            if is_temp_file and os.path.exists(actual_img_path):
-                try:
-                    os.remove(actual_img_path)
-                except:
-                    pass
+            # 转换缓存由全局缓存管理，避免每次 OCR 反复转码
+            pass
     
     def stop(self):
         """停止 OCR 引擎"""
@@ -286,6 +336,9 @@ class ImageCard(QFrame):
     clicked = Signal(str)          # 点击信号：卡片被点击
     double_clicked = Signal(str)   # 双击信号：卡片被双击
     delete_clicked = Signal(str)   # 删除信号：右上角删除按钮
+    _PIXMAP_CACHE: Dict[str, QPixmap] = {}
+    _PIXMAP_CACHE_ORDER: List[str] = []
+    _PIXMAP_CACHE_MAX: int = 220
     
     def __init__(self, img_path: str, filename: str, ocr_text: str = "", parent=None):
         super().__init__(parent)
@@ -444,6 +497,37 @@ class ImageCard(QFrame):
     # 缩略图最大边长，大图先缩小再显示，减轻卡顿
     _THUMB_MAX = 600
 
+    @classmethod
+    def _pixmap_cache_get(cls, key: str) -> Optional[QPixmap]:
+        pix = cls._PIXMAP_CACHE.get(key)
+        if pix is None:
+            return None
+        # 轻量 LRU：命中后移动到末尾
+        try:
+            cls._PIXMAP_CACHE_ORDER.remove(key)
+        except ValueError:
+            pass
+        cls._PIXMAP_CACHE_ORDER.append(key)
+        return pix
+
+    @classmethod
+    def _pixmap_cache_put(cls, key: str, pixmap: QPixmap):
+        if pixmap.isNull():
+            return
+        if key in cls._PIXMAP_CACHE:
+            cls._PIXMAP_CACHE[key] = pixmap
+            try:
+                cls._PIXMAP_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            cls._PIXMAP_CACHE_ORDER.append(key)
+            return
+        cls._PIXMAP_CACHE[key] = pixmap
+        cls._PIXMAP_CACHE_ORDER.append(key)
+        while len(cls._PIXMAP_CACHE_ORDER) > cls._PIXMAP_CACHE_MAX:
+            evict_key = cls._PIXMAP_CACHE_ORDER.pop(0)
+            cls._PIXMAP_CACHE.pop(evict_key, None)
+
     def load_image(self, img_path: str):
         """加载图片（支持多格式；大图自动缩略以减轻卡顿）"""
         try:
@@ -452,8 +536,21 @@ class ImageCard(QFrame):
                 print(f"[图片加载] 文件不存在: {img_path}")
                 return
 
+            # 缩略图显示区域固定，缓存键包含 path+mtime+目标尺寸，避免重复解码与缩放
+            target_width = max(160, self.width() - 40)
+            target_height = 220
+            src_mtime = os.path.getmtime(img_path)
+            cache_key = f"{os.path.abspath(img_path)}|{src_mtime}|{target_width}x{target_height}"
+            cached_scaled = self._pixmap_cache_get(cache_key)
+            if cached_scaled is not None and not cached_scaled.isNull():
+                self.image_label.setPixmap(cached_scaled)
+                self.image_label.setFixedHeight(target_height)
+                self.image_label.setToolTip(f"双击查看大图\n{img_path}")
+                return
+
+            source_path = get_cached_image_path(img_path)
             pixmap = None
-            reader = QImageReader(img_path)
+            reader = QImageReader(source_path)
             if reader.canRead():
                 sz = reader.size()
                 if sz.isValid() and (sz.width() > self._THUMB_MAX or sz.height() > self._THUMB_MAX):
@@ -465,14 +562,14 @@ class ImageCard(QFrame):
                     if not img.isNull():
                         pixmap = QPixmap.fromImage(img)
             if pixmap is None or pixmap.isNull():
-                pixmap = QPixmap(img_path)
+                pixmap = QPixmap(source_path)
 
             # 如果QPixmap加载失败，尝试用PIL转换格式
             if pixmap.isNull():
                 # QPixmap 失败时尝试使用 PIL 兜底，不再频繁打印日志
                 try:
                     # 使用PIL打开图片（支持更多格式，如AVIF）
-                    with Image.open(img_path) as pil_img:
+                    with Image.open(source_path) as pil_img:
                         # 转换为RGB模式（QPixmap需要）
                         if pil_img.mode in ('RGBA', 'LA', 'P'):
                             rgb_img = Image.new('RGB', pil_img.size, (255, 255, 255))
@@ -503,15 +600,13 @@ class ImageCard(QFrame):
             
             # 按固定宽高比缩放（不裁剪），保证卡片高度统一且完整显示
             if not pixmap.isNull():
-                # 统一预览区域尺寸，形成整齐栅格
-                target_width = max(160, self.width() - 40)
-                target_height = 220
                 scaled_pixmap = pixmap.scaled(
                     target_width,
                     target_height,
                     Qt.KeepAspectRatio,
                     Qt.SmoothTransformation
                 )
+                self._pixmap_cache_put(cache_key, scaled_pixmap)
                 self.image_label.setPixmap(scaled_pixmap)
                 # 固定高度，保持所有卡片排版统一
                 self.image_label.setFixedHeight(target_height)
@@ -3012,7 +3107,10 @@ class OCRImageMatcher(QMainWindow):
         if self.ocr_controller:
             self.ocr_controller.stop()
 
-        # 3. 正常关闭窗口
+        # 3. 清理 AVIF/HEIC 转换缓存文件
+        clear_image_conversion_cache()
+
+        # 4. 正常关闭窗口
         event.accept()
 
 
