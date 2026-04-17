@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Umi-OCR 智能重命名助手
+kk-ocr-match
 功能：选择A组和B组文件夹，自动OCR识别并匹配，将B组图片重命名为A组对应的图片名称
 
 系统架构：
@@ -72,6 +72,7 @@ except ImportError:
 
 # AVIF/HEIC 转换缓存：同一原图（按 path+mtime）仅转换一次，供 OCR 与缩略图复用
 _CONVERTED_IMAGE_CACHE: Dict[str, Dict[str, object]] = {}
+APP_NAME = "kk-ocr-match"
 
 
 def get_cached_image_path(img_path: str) -> str:
@@ -147,6 +148,28 @@ def clear_image_conversion_cache():
             except Exception:
                 pass
     _CONVERTED_IMAGE_CACHE.clear()
+
+
+def find_logo_resource_path() -> str:
+    """查找项目 logo 资源，统一使用 @logo 命名。"""
+    candidates = [
+        "@logo",
+        "@logo.ico",
+        "@logo.png",
+        os.path.join("logo", "@logo.ico"),
+        os.path.join("logo", "@logo.png"),
+        os.path.join("..", "logo", "logo_ico_256x256.ico"),
+        os.path.join("..", "logo", "logo_ico_64x64.ico"),
+        os.path.join("..", "logo", "logo_ico_64x64.png"),
+        os.path.join("..", "..", "logo", "logo_ico_256x256.ico"),
+        os.path.join("..", "..", "logo", "logo_ico_64x64.ico"),
+        os.path.join("..", "..", "logo", "logo_ico_64x64.png"),
+    ]
+    for candidate in candidates:
+        abs_path = resource_path(candidate)
+        if os.path.exists(abs_path):
+            return abs_path
+    return ""
 
 
 class OCRController:
@@ -788,11 +811,14 @@ class ImageCard(QFrame):
 
 
 class OCRImageMatcher(QMainWindow):
-    """Umi-OCR 智能重命名助手主窗口"""
+    """kk-ocr-match 主窗口"""
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Umi-OCR 智能重命名助手")
+        self.setWindowTitle(APP_NAME)
+        logo_path = find_logo_resource_path()
+        if logo_path:
+            self.setWindowIcon(QIcon(logo_path))
         self.setGeometry(100, 100, 1600, 1000)
         
         # 数据存储
@@ -914,7 +940,7 @@ class OCRImageMatcher(QMainWindow):
         header_layout = QHBoxLayout(header_frame)
         
         # 标题
-        title_label = QLabel("Umi-OCR 智能重命名助手")
+        title_label = QLabel(APP_NAME)
         title_font = QFont()
         title_font.setPointSize(18)
         title_font.setBold(True)

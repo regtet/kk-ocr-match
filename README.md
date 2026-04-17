@@ -1,6 +1,6 @@
 ## 项目简介
 
-本项目是一个基于 **PaddleOCR-json** 的桌面工具——**Umi-OCR 智能重命名助手**。  
+本项目是一个基于 **PaddleOCR-json** 的桌面工具——**kk-ocr-match**。  
 它通过对两组图片（A 组、B 组）进行 OCR 文字识别与相似度匹配，将 **B 组图片自动重命名为 A 组对应的图片名称**，适用于：
 
 - **批量图片归档**：如教材截图、试卷、文档扫描件等
@@ -19,6 +19,10 @@
 ## 项目构成
 
 ### 主要文件与目录
+
+- **`scripts/`**
+  - 放置工程脚本（如一键打包脚本），避免根目录堆积临时操作文件。
+  - 当前包含：`scripts/build_release.bat`（根目录 `build_release.bat` 为兼容入口）。
 
 - **`main.py`**  
   - **应用主程序入口**：启动 PySide6 界面、初始化 OCR 引擎、管理业务逻辑。
@@ -56,10 +60,10 @@
     - 打包产物：`build/`, `dist/`, `*.spec`  
     - IDE 配置与临时文件：`.vscode/`, `.idea/`, `*.log`, `*.tmp`, `*.bak` 等
 
-- **`UmiOCR-Rename.spec`（可选存在）**  
+- **`kk-ocr-match.spec`（可选存在）**  
   - PyInstaller 自动生成的打包配置文件：
     - 记录入口脚本、打包模式（onefile/onedir）、附加数据、图标等设置。
-    - 可以用 `pyinstaller UmiOCR-Rename.spec` 按相同配置重新打包。
+    - 可以用 `pyinstaller kk-ocr-match.spec` 按相同配置重新打包。
   - 本仓库默认通过 `.gitignore` 忽略该文件，如需固定打包配置，可手动将其纳入版本控制。
 
 - **`build/`（打包时自动生成）**  
@@ -68,7 +72,7 @@
 
 - **`dist/`（打包输出目录）**  
   - 存放最终生成的可执行文件：
-    - `UmiOCR-Rename.exe`：打包后的独立 EXE。
+    - `kk-ocr-match.exe`：打包后的独立 EXE。
     - `PaddleOCR-json_v1.4.1/`：发布时需要手动复制到此目录，与 EXE 同级。
   - 可以整体压缩并分发给用户使用。
 
@@ -238,41 +242,38 @@ python main.py
 
 采用 **“半独立打包”方案**：**1 个 GUI EXE + 1 个 OCR 文件夹**，即：
 
-- `UmiOCR-Rename.exe`
+- `kk-ocr-match.exe`
 - `PaddleOCR-json_v1.4.1\`（与 exe 同级，保持完整原始结构）
 
-### 1. 准备打包环境
+### 一键打包（推荐）
 
-在项目根目录执行：
-
-```bash
-python -m venv venv
-venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install pyinstaller PySide6 pillow fuzzywuzzy python-Levenshtein
-```
-
-> **说明**：`python-Levenshtein` 用于加速 `fuzzywuzzy`，大幅提高相似度计算性能。
-
-### 2. 打包命令
-
-在已激活虚拟环境、当前目录为项目根目录时执行：
+在项目根目录执行一条命令：
 
 ```bash
-python -m PyInstaller --name "UmiOCR-Rename" --noconfirm --noconsole --onefile main.py
+build_release.bat
 ```
 
-完成后，`dist` 目录中会生成：
+如果是在 IDE / 终端里执行，不希望最后停在 `pause`，可以用：
 
-- `dist\UmiOCR-Rename.exe`
+```bash
+build_release.bat --no-pause
+```
 
-### 3. 布置 OCR 引擎文件夹
+该脚本会自动完成：
 
-将整个 `PaddleOCR-json_v1.4.1` 目录复制到 `dist` 目录下，形成结构：
+- 创建/复用 `venv`
+- 安装/更新打包依赖
+- 执行 `PyInstaller` 打包
+- 自动复制 `PaddleOCR-json_v1.4.1` 到 `dist`
+- 写入完整日志到 `build\build_release_last.log`（失败会自动停住并输出日志）
+
+> 图标说明：请把图标文件放到项目根目录，命名为 `@logo.ico`（或 `@logo.png`）。
+
+执行成功后目录结构：
 
 ```text
 dist\
-  ├─ UmiOCR-Rename.exe
+  ├─ kk-ocr-match.exe
   └─ PaddleOCR-json_v1.4.1\
       ├─ PaddleOCR-json.exe
       ├─ models\
@@ -280,9 +281,9 @@ dist\
       └─ ...
 ```
 
-此时，可直接双击 `UmiOCR-Rename.exe` 使用，无需本地安装 Python。
+此时，可直接双击 `kk-ocr-match.exe` 使用，无需本地安装 Python。
 
-### 4. 打包相关代码约定（已经在项目中实现）
+### 打包相关代码约定（已经在项目中实现）
 
 - 使用 `get_base_dir()` 与 `resource_path()` 统一获取资源路径，保证：
   - 开发环境：从 `main.py` 所在目录查找；
