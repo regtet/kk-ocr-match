@@ -334,6 +334,10 @@ class OCRWorker(QThread):
                 )
                 
                 text = self.ocr_controller.get_text(img_path)
+                # OCR 偶发返回空时重试一次，降低批处理漏识别概率
+                if not text:
+                    time.sleep(0.08)
+                    text = self.ocr_controller.get_text(img_path)
                 self.results[img_path] = text
                 
                 self.progress.emit(
@@ -862,6 +866,9 @@ class OCRImageMatcher(QMainWindow):
         self.batch_results: Dict[str, Dict[str, object]] = {}
         self._updating_batch_summary: bool = False
         self._switching_batch_group: bool = False
+        # 批处理 OCR 防串扰：仅允许当前任务令牌推进队列
+        self._batch_task_token: int = 0
+        self._active_worker_b_token: int = 0
         self._pending_b_table_refresh_timer: Optional[QTimer] = None
 
         # OCR引擎
@@ -1454,6 +1461,8 @@ class OCRImageMatcher(QMainWindow):
         """)
         self.batch_summary_list.setMinimumHeight(140)
         self.batch_summary_list.setMaximumHeight(180)
+        self.batch_summary_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.batch_summary_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.batch_summary_list.currentRowChanged.connect(self.on_batch_summary_row_changed)
         self.batch_summary_list.setVisible(False)
         center_vbox.addWidget(self.batch_summary_list)
@@ -1705,6 +1714,57 @@ class OCRImageMatcher(QMainWindow):
                     image_files.append(os.path.join(root, file))
         
         return sorted(image_files)
+
+    def flatten_redundant_folder_chain(self, folder_path: str) -> str:
+        """
+        物理去除多余“套娃目录”：
+        当当前目录仅包含 1 个子目录且没有任何文件时，将子目录内容上移到当前目录并删除该子目录。
+        会持续处理直到不满足条件。
+
+        返回原始根目录绝对路径（内容已被就地扁平化）。
+        """
+        if not folder_path or not os.path.isdir(folder_path):
+            return folder_path
+
+        root = os.path.abspath(folder_path)
+        flattened_layers = 0
+
+        while True:
+            try:
+                children = list(os.scandir(root))
+            except OSError:
+                break
+
+            subdirs = [item for item in children if item.is_dir()]
+            files = [item for item in children if item.is_file()]
+
+            # 仅在“无文件 + 单子目录”时视为可安全去套娃
+            if len(files) == 0 and len(subdirs) == 1:
+                child_dir = subdirs[0].path
+                try:
+                    moved = False
+                    for item in os.listdir(child_dir):
+                        src = os.path.join(child_dir, item)
+                        dst = os.path.join(root, item)
+                        if os.path.exists(dst):
+                            # 同名冲突时停止，避免覆盖
+                            self.log(f"⚠ 去除嵌套停止：存在同名目标 {dst}")
+                            return root
+                        os.replace(src, dst)
+                        moved = True
+
+                    os.rmdir(child_dir)
+                    if moved:
+                        flattened_layers += 1
+                    continue
+                except Exception as e:
+                    self.log(f"⚠ 去除嵌套失败：{e}")
+                    break
+            break
+
+        if flattened_layers > 0:
+            self.log(f"已自动去除 {flattened_layers} 层目录嵌套：{root}")
+        return root
     
     def filter_image_files(self, file_paths: List[str]) -> List[str]:
         """过滤出图片文件"""
@@ -1875,6 +1935,9 @@ class OCRImageMatcher(QMainWindow):
         
         self._stop_worker_thread("worker_b", timeout_ms=1200)
         self.worker_b = OCRWorker(self.ocr_controller, self.group_b_images, "B组")
+        self._batch_task_token += 1
+        self._active_worker_b_token = self._batch_task_token
+        setattr(self.worker_b, "task_token", self._active_worker_b_token)
         self.worker_b.progress.connect(self.on_ocr_b_progress)
         self.worker_b.finished.connect(self.on_ocr_b_finished)
         self.worker_b.start()
@@ -1890,6 +1953,9 @@ class OCRImageMatcher(QMainWindow):
         
         self._stop_worker_thread("worker_b", timeout_ms=1200)
         self.worker_b = OCRWorker(self.ocr_controller, image_files, "B组")
+        self._batch_task_token += 1
+        self._active_worker_b_token = self._batch_task_token
+        setattr(self.worker_b, "task_token", self._active_worker_b_token)
         self.worker_b.progress.connect(self.on_ocr_b_progress)
         self.worker_b.finished.connect(self.on_ocr_b_finished)
         self.worker_b.start()
@@ -1933,6 +1999,9 @@ class OCRImageMatcher(QMainWindow):
     
     def on_ocr_b_progress(self, img_path: str, text: str, status_msg: str):
         """B组OCR进度更新（实时）"""
+        sender = self.sender()
+        if sender is not None and sender is not self.worker_b:
+            return
         self.log(status_msg)
         
         if text:  # 有识别结果
@@ -2009,6 +2078,14 @@ class OCRImageMatcher(QMainWindow):
     def on_ocr_b_finished(self):
         """B组OCR完成"""
         try:
+            sender = self.sender()
+            if sender is not None and sender is not self.worker_b:
+                return
+            sender_token = getattr(sender, "task_token", None) if sender is not None else None
+            if sender_token is not None and sender_token != self._active_worker_b_token:
+                self.log("[批处理保护] 忽略过期 OCR 完成信号")
+                return
+
             self.log("B组识别完成！")
             self.b_select_files_btn.setEnabled(True)
             self.b_select_folder_btn.setEnabled(True)
@@ -2023,6 +2100,9 @@ class OCRImageMatcher(QMainWindow):
             self.trigger_auto_match_if_ready()
             if self.batch_mode_enabled:
                 self.finalize_batch_task(success=True)
+            # 当前 worker 收尾后清理引用，避免后续旧信号误入
+            if sender is self.worker_b:
+                self.worker_b = None
         except Exception as e:
             self.log(f"[OCR完成异常] B组收尾失败: {e}")
             if self.batch_mode_enabled:
@@ -2471,6 +2551,13 @@ class OCRImageMatcher(QMainWindow):
         urls = event.mimeData().urls()
         if urls:
             file_paths = [url.toLocalFile() for url in urls]
+            folder_paths = [os.path.abspath(p) for p in file_paths if os.path.isdir(p)]
+
+            # 单个文件夹上传：按“文件夹模式”处理，并执行物理去嵌套
+            if len(file_paths) == 1 and len(folder_paths) == 1:
+                self.select_folder_a_internal(folder_paths[0])
+                return
+
             image_files = self.filter_image_files(file_paths)
             if image_files:
                 self.add_images_to_group_a(image_files)
@@ -2499,6 +2586,11 @@ class OCRImageMatcher(QMainWindow):
                 self.start_batch_process(folder_paths)
                 return
 
+            # 单个文件夹上传：按“文件夹模式”处理，并执行物理去嵌套
+            if len(file_paths) == 1 and len(folder_paths) == 1:
+                self.select_folder_b_internal(folder_paths[0])
+                return
+
             image_files = self.filter_image_files(file_paths)
             if image_files:
                 self.add_images_to_group_b(image_files)
@@ -2514,7 +2606,13 @@ class OCRImageMatcher(QMainWindow):
             QMessageBox.warning(self, "警告", "请先准备并识别 A 组图片，再进行多文件夹批处理。")
             return
 
-        valid_folders = [f for f in b_folders if os.path.isdir(f)]
+        valid_folders = []
+        for f in b_folders:
+            if not os.path.isdir(f):
+                continue
+            abs_f = os.path.abspath(f)
+            if abs_f not in valid_folders:
+                valid_folders.append(abs_f)
         if not valid_folders:
             QMessageBox.warning(self, "警告", "未找到有效的文件夹。")
             return
@@ -2564,17 +2662,11 @@ class OCRImageMatcher(QMainWindow):
 
             folder = str(current_task.get("b_folder", ""))
             self.log(f"[批处理 {next_index+1}/{len(self.batch_tasks)}] 处理中：{os.path.basename(folder)}")
-
-            had_cache = folder in self.ocr_cache
-            self.select_folder_b_internal(folder)
-
-            # 命中缓存时不会触发 OCR 完成回调，需要在此处直接推进流程
-            if had_cache:
-                try:
-                    self.trigger_auto_match_if_ready()
-                    self.finalize_batch_task(success=True)
-                except Exception as e:
-                    self.finalize_batch_task(success=False, error=str(e))
+            # 批处理中强制全量重识别，避免旧缓存导致 0/ 或漏图
+            self.select_folder_b_internal(folder, force_reocr=True)
+            if not self.group_b_images:
+                self.log(f"[批处理跳过] {os.path.basename(folder)} 未找到可识别图片。")
+                self.finalize_batch_task(success=True)
         except Exception as e:
             self.log(f"[批处理异常] 处理下一组失败: {e}")
             self.finalize_batch_task(success=False, error=str(e))
@@ -2587,6 +2679,12 @@ class OCRImageMatcher(QMainWindow):
             return
 
         task = self.batch_tasks[self.batch_current_index]
+        current_status = str(task.get("status", ""))
+        # 防止同一任务被重复收尾（会导致跳组、乱序）
+        if current_status in ("done", "failed"):
+            return
+        if current_status != "running":
+            return
         folder = str(task.get("b_folder", ""))
         total_count = len(self.group_b_images)
         matched_count = sum(1 for info in self.group_b_info.values() if info.get("matched", False))
@@ -2649,15 +2747,22 @@ class OCRImageMatcher(QMainWindow):
                 else:
                     status_text = "待处理"
 
-                item_text = f"{idx+1}. {os.path.basename(folder)} | {status_text} | {matched_count}/{a_total_count}"
-                self.batch_summary_list.addItem(item_text)
+                # 把进度前置，避免长文件夹名遮挡看不见 x/x
+                item_text = f"{idx+1}. [{matched_count}/{a_total_count}] {status_text} | {os.path.basename(folder)}"
+                item = QListWidgetItem(item_text)
+                item.setToolTip(str(folder))
+                self.batch_summary_list.addItem(item)
 
             if self.batch_tasks:
                 self.batch_summary_title.setVisible(True)
                 self.batch_summary_list.setVisible(True)
-                highlight_index = self.batch_selected_index
-                if highlight_index < 0:
+                # 批处理中始终高亮当前处理项，避免看起来“跳序处理”
+                if self.batch_mode_enabled and self.batch_current_index >= 0:
                     highlight_index = self.batch_current_index
+                else:
+                    highlight_index = self.batch_selected_index
+                    if highlight_index < 0:
+                        highlight_index = self.batch_current_index
                 if highlight_index >= 0 and highlight_index < self.batch_summary_list.count():
                     self.batch_summary_list.setCurrentRow(highlight_index)
             else:
@@ -2673,6 +2778,15 @@ class OCRImageMatcher(QMainWindow):
         if self._updating_batch_summary or self._switching_batch_group:
             return
         if row < 0 or row >= len(self.batch_tasks):
+            return
+        # 批处理中完全禁止通过总览切换（包括当前行），避免重入导致重复启动 OCR
+        if self.batch_mode_enabled:
+            if 0 <= self.batch_current_index < len(self.batch_tasks):
+                self.batch_summary_list.blockSignals(True)
+                self.batch_summary_list.setCurrentRow(self.batch_current_index)
+                self.batch_summary_list.blockSignals(False)
+            if row != self.batch_current_index:
+                self.log("批处理中已锁定当前处理项，完成后可切换查看。")
             return
         self.batch_selected_index = row
         task = self.batch_tasks[row]
@@ -2824,6 +2938,7 @@ class OCRImageMatcher(QMainWindow):
     
     def select_folder_a_internal(self, folder: str):
         """内部方法：选择A组文件夹"""
+        folder = self.flatten_redundant_folder_chain(folder)
         self.group_a_folder = folder
         self.a_folder_label.setText(f"📁 {folder}")
         self.log(f"已选择A组文件夹: {folder}")
@@ -2847,8 +2962,9 @@ class OCRImageMatcher(QMainWindow):
         else:
             self.start_ocr_a()
     
-    def select_folder_b_internal(self, folder: str):
+    def select_folder_b_internal(self, folder: str, force_reocr: bool = False):
         """内部方法：选择B组文件夹"""
+        folder = self.flatten_redundant_folder_chain(folder)
         self.group_b_folder = folder
         self.b_folder_label.setText(f"📁 {folder}")
         self.log(f"已选择B组文件夹: {folder}")
@@ -2874,7 +2990,10 @@ class OCRImageMatcher(QMainWindow):
         self.update_a_table()
         
         cache_key = folder
-        if cache_key in self.ocr_cache:
+        if force_reocr:
+            self.ocr_cache.pop(cache_key, None)
+            self.start_ocr_b()
+        elif cache_key in self.ocr_cache:
             self.log("使用缓存的OCR结果")
             self.group_b_texts = self.ocr_cache[cache_key].copy()
             self.update_b_table()
