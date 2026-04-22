@@ -75,10 +75,23 @@ _CONVERTED_IMAGE_CACHE: Dict[str, Dict[str, object]] = {}
 APP_NAME = "kk-ocr-match"
 
 
+def get_file_extension(file_path: str) -> str:
+    """
+    获取文件扩展名（小写，含点），兼容仅扩展名文件名（如 `.avif`）。
+    """
+    name = os.path.basename(file_path or "")
+    if not name:
+        return ""
+    # 兼容 ".avif" 这类“无主名仅扩展名”的文件
+    if name.startswith(".") and name.count(".") == 1 and len(name) > 1:
+        return name.lower()
+    return Path(name).suffix.lower()
+
+
 def get_cached_image_path(img_path: str) -> str:
     """获取可直接读取的图片路径；对 AVIF/HEIC 做一次性缓存转换后复用。"""
     abs_img_path = os.path.abspath(img_path)
-    ext = Path(abs_img_path).suffix.lower()
+    ext = get_file_extension(abs_img_path)
     unsupported_formats = {".avif", ".heic", ".heif"}
 
     if ext not in unsupported_formats:
@@ -1710,7 +1723,7 @@ class OCRImageMatcher(QMainWindow):
         
         for root, dirs, files in os.walk(folder_path):
             for file in files:
-                if Path(file).suffix.lower() in image_extensions:
+                if get_file_extension(file) in image_extensions:
                     image_files.append(os.path.join(root, file))
         
         return sorted(image_files)
@@ -1773,7 +1786,7 @@ class OCRImageMatcher(QMainWindow):
         
         for file_path in file_paths:
             if os.path.isfile(file_path):
-                if Path(file_path).suffix.lower() in image_extensions:
+                if get_file_extension(file_path) in image_extensions:
                     image_files.append(file_path)
             elif os.path.isdir(file_path):
                 # 如果是文件夹，扫描其中的图片
@@ -3115,7 +3128,7 @@ class OCRImageMatcher(QMainWindow):
             if best_match_a_path and best_similarity >= self.threshold:
                 # 记录为“待重命名”，不立刻修改真实文件名
                 a_name = Path(best_match_a_path).stem
-                b_ext = Path(b_path).suffix
+                b_ext = get_file_extension(b_path) or Path(b_path).suffix
                 new_name = f"{a_name}{b_ext}"
 
                 # 更新数据：仅记录匹配关系
@@ -3299,7 +3312,7 @@ class OCRImageMatcher(QMainWindow):
 
         # 执行重命名：当前这对 A-B 将成为“唯一合法配对”
         a_name = Path(a_path).stem
-        b_ext = Path(b_path).suffix
+        b_ext = get_file_extension(b_path) or Path(b_path).suffix
         new_name = f"{a_name}{b_ext}"
         
         try:
