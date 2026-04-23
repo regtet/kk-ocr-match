@@ -323,7 +323,7 @@ class ImageSizeWorker(QThread):
 class OCRWorker(QThread):
     """OCR识别工作线程（支持实时更新）"""
     progress = Signal(str, str, str)  # 图片路径, OCR文本, 状态消息
-    finished = Signal()
+    worker_done = Signal()
     
     def __init__(self, ocr_controller, image_paths: List[str], group_name: str):
         super().__init__()
@@ -369,7 +369,7 @@ class OCRWorker(QThread):
                     f"✗ {self.group_name}: {i+1}/{total} - {os.path.basename(img_path)} 识别失败: {e}"
                 )
         
-        self.finished.emit()
+        self.worker_done.emit()
 
 
 class ImageCard(QFrame):
@@ -1919,7 +1919,7 @@ class OCRImageMatcher(QMainWindow):
         self._stop_worker_thread("worker_a", timeout_ms=1200)
         self.worker_a = OCRWorker(self.ocr_controller, self.group_a_images, "A组")
         self.worker_a.progress.connect(self.on_ocr_a_progress)
-        self.worker_a.finished.connect(self.on_ocr_a_finished)
+        self.worker_a.worker_done.connect(self.on_ocr_a_finished)
         self.worker_a.start()
     
     def start_ocr_a_specific(self, image_files: List[str]):
@@ -1934,7 +1934,7 @@ class OCRImageMatcher(QMainWindow):
         self._stop_worker_thread("worker_a", timeout_ms=1200)
         self.worker_a = OCRWorker(self.ocr_controller, image_files, "A组")
         self.worker_a.progress.connect(self.on_ocr_a_progress)
-        self.worker_a.finished.connect(self.on_ocr_a_finished)
+        self.worker_a.worker_done.connect(self.on_ocr_a_finished)
         self.worker_a.start()
     
     def start_ocr_b(self):
@@ -1952,7 +1952,7 @@ class OCRImageMatcher(QMainWindow):
         self._active_worker_b_token = self._batch_task_token
         setattr(self.worker_b, "task_token", self._active_worker_b_token)
         self.worker_b.progress.connect(self.on_ocr_b_progress)
-        self.worker_b.finished.connect(self.on_ocr_b_finished)
+        self.worker_b.worker_done.connect(self.on_ocr_b_finished)
         self.worker_b.start()
     
     def start_ocr_b_specific(self, image_files: List[str]):
@@ -1970,7 +1970,7 @@ class OCRImageMatcher(QMainWindow):
         self._active_worker_b_token = self._batch_task_token
         setattr(self.worker_b, "task_token", self._active_worker_b_token)
         self.worker_b.progress.connect(self.on_ocr_b_progress)
-        self.worker_b.finished.connect(self.on_ocr_b_finished)
+        self.worker_b.worker_done.connect(self.on_ocr_b_finished)
         self.worker_b.start()
     
     def on_ocr_a_progress(self, img_path: str, text: str, status_msg: str):
