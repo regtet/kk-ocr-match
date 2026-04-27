@@ -88,6 +88,18 @@ def get_file_extension(file_path: str) -> str:
     return Path(name).suffix.lower()
 
 
+def is_same_path(path_a: str, path_b: str) -> bool:
+    """
+    判断两个路径是否指向同一位置（跨平台、忽略大小写差异）。
+    主要用于 Windows 下避免把同一路径误判为重名冲突。
+    """
+    if not path_a or not path_b:
+        return False
+    norm_a = os.path.normcase(os.path.abspath(path_a))
+    norm_b = os.path.normcase(os.path.abspath(path_b))
+    return norm_a == norm_b
+
+
 def get_cached_image_path(img_path: str) -> str:
     """获取可直接读取的图片路径；对 AVIF/HEIC 做一次性缓存转换后复用。"""
     abs_img_path = os.path.abspath(img_path)
@@ -1571,7 +1583,8 @@ class OCRImageMatcher(QMainWindow):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(70)
+        self.log_text.setMinimumHeight(140)
+        self.log_text.setMaximumHeight(220)
         self.log_text.setStyleSheet("""
             QTextEdit {
                 border: 1px solid #ddd;
@@ -3203,7 +3216,7 @@ class OCRImageMatcher(QMainWindow):
                             
                             # 尝试恢复原名，如果原名也被占用则用随机名
                             restore_path = os.path.join(other_dir, other_original_name)
-                            if os.path.exists(restore_path) and restore_path != other_b_path:
+                            if os.path.exists(restore_path) and not is_same_path(restore_path, other_b_path):
                                 # 原名被占用，用随机名
                                 from time import time as _time
                                 ext = Path(other_original_name).suffix
@@ -3212,14 +3225,14 @@ class OCRImageMatcher(QMainWindow):
                                 restore_path = os.path.join(other_dir, f"{base}_restored_{rand_token}{ext}")
                                 counter_restore = 1
                                 original_restore_path = restore_path
-                                while os.path.exists(restore_path) and restore_path != other_b_path:
+                                while os.path.exists(restore_path) and not is_same_path(restore_path, other_b_path):
                                     restore_path = os.path.join(
                                         other_dir,
                                         f"{Path(original_restore_path).stem}_{counter_restore}{ext}"
                                     )
                                     counter_restore += 1
                             
-                            if os.path.exists(other_b_path) and other_b_path != restore_path:
+                            if os.path.exists(other_b_path) and not is_same_path(other_b_path, restore_path):
                                 os.rename(other_b_path, restore_path)
                             
                             # 更新旧图片的路径和数据
@@ -3249,7 +3262,7 @@ class OCRImageMatcher(QMainWindow):
                 # 如果目标路径仍然被占用（文件系统中存在但不是我们管理的B组图片），才加后缀
                 counter = 1
                 original_new_path = new_path
-                while os.path.exists(new_path) and new_path != b_path:
+                while os.path.exists(new_path) and not is_same_path(new_path, b_path):
                     name_without_ext = Path(original_new_path).stem
                     ext = Path(original_new_path).suffix
                     new_path = os.path.join(b_dir, f"{name_without_ext}_{counter}{ext}")
@@ -3284,7 +3297,38 @@ class OCRImageMatcher(QMainWindow):
                     success_count += 1
                     self.log(f"✅ 重命名成功：{os.path.basename(b_path)} → {os.path.basename(new_path)}")
                 else:
-                    self.log(f"跳过：{os.path.basename(b_path)}（名称相同）")
+                    # 名称已相同：无需改名，但仍应视为已完成正式配对，
+                    # 否则后续同名匹配会把当前文件当作“未完成项”，导致额外追加 _1。
+                    if b_path in self.group_b_info:
+                        info_same = self.group_b_info[b_path]
+                    else:
+                        info_same = {}
+                    if 'original_name' not in info_same:
+                        info_same['original_name'] = os.path.basename(b_path)
+                    info_same['matched'] = True
+                    info_same['new_name'] = os.path.basename(b_path)
+                    info_same['renamed'] = True
+                    self.group_b_info[b_path] = info_same
+
+                    # 标记对应A图已使用，保持排序/高亮一致
+                    matched_a_path = info_same.get('matched_a_path')
+                    if matched_a_path:
+                        a_info = self.group_a_info.get(matched_a_path, {})
+                        a_info['used'] = True
+                        self.group_a_info[matched_a_path] = a_info
+
+                        # 保证一对一：释放其他占用同一A的B图
+                        for other_b_path, other_info in list(self.group_b_info.items()):
+                            if other_b_path == b_path:
+                                continue
+                            if other_info.get('matched') and other_info.get('matched_a_path') == matched_a_path:
+                                other_info['matched'] = False
+                                other_info['matched_a_path'] = None
+                                other_info['new_name'] = os.path.basename(other_b_path)
+                                self.group_b_info[other_b_path] = other_info
+
+                    success_count += 1
+                    self.log(f"✅ 跳过重命名：{os.path.basename(b_path)}（名称相同，已标记配对）")
             except Exception as e:
                 error_count += 1
                 self.log(f"❌ 重命名失败 {os.path.basename(b_path)}: {e}")
@@ -3337,7 +3381,7 @@ class OCRImageMatcher(QMainWindow):
                         
                         # 尝试恢复原名，如果原名也被占用则用随机名
                         restore_path = os.path.join(other_dir, other_original_name)
-                        if os.path.exists(restore_path) and restore_path != other_b_path:
+                        if os.path.exists(restore_path) and not is_same_path(restore_path, other_b_path):
                             # 原名被占用，用随机名
                             from time import time as _time
                             ext = Path(other_original_name).suffix
@@ -3346,14 +3390,14 @@ class OCRImageMatcher(QMainWindow):
                             restore_path = os.path.join(other_dir, f"{base}_restored_{rand_token}{ext}")
                             counter_restore = 1
                             original_restore_path = restore_path
-                            while os.path.exists(restore_path) and restore_path != other_b_path:
+                            while os.path.exists(restore_path) and not is_same_path(restore_path, other_b_path):
                                 restore_path = os.path.join(
                                     other_dir,
                                     f"{Path(original_restore_path).stem}_{counter_restore}{ext}"
                                 )
                                 counter_restore += 1
                         
-                        if os.path.exists(other_b_path) and other_b_path != restore_path:
+                        if os.path.exists(other_b_path) and not is_same_path(other_b_path, restore_path):
                             os.rename(other_b_path, restore_path)
                         
                         # 更新旧图片的路径和数据
@@ -3383,7 +3427,7 @@ class OCRImageMatcher(QMainWindow):
             # 如果目标路径仍然被占用（文件系统中存在但不是我们管理的B组图片），才加后缀
             counter = 1
             original_new_path = new_path
-            while os.path.exists(new_path) and new_path != b_path:
+            while os.path.exists(new_path) and not is_same_path(new_path, b_path):
                 name_without_ext = Path(original_new_path).stem
                 ext = Path(original_new_path).suffix
                 new_path = os.path.join(b_dir, f"{name_without_ext}_{counter}{ext}")
@@ -3440,14 +3484,14 @@ class OCRImageMatcher(QMainWindow):
                             alt_path = os.path.join(other_dir, f"{base}_old_{rand_token}{ext}")
                             counter2 = 1
                             original_alt_path = alt_path
-                            while os.path.exists(alt_path) and alt_path != other_b_path:
+                            while os.path.exists(alt_path) and not is_same_path(alt_path, other_b_path):
                                 alt_path = os.path.join(
                                     other_dir,
                                     f"{Path(original_alt_path).stem}_{counter2}{ext}"
                                 )
                                 counter2 += 1
 
-                            if os.path.exists(other_b_path) and other_b_path != alt_path:
+                            if os.path.exists(other_b_path) and not is_same_path(other_b_path, alt_path):
                                 os.rename(other_b_path, alt_path)
 
                             # 更新列表与映射中的路径
