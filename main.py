@@ -52,7 +52,8 @@ from PySide6.QtWidgets import (
     QPushButton, QLabel, QTextEdit, QFileDialog, QProgressBar,
     QTableWidget, QTableWidgetItem, QMessageBox, QGroupBox, QSlider,
     QScrollArea, QListWidget, QListWidgetItem, QHeaderView, QFrame,
-    QLineEdit, QGraphicsDropShadowEffect, QCheckBox, QButtonGroup, QSizePolicy
+    QLineEdit, QGraphicsDropShadowEffect, QCheckBox, QButtonGroup, QSizePolicy,
+    QInputDialog
 )
 from PySide6.QtCore import Qt, Signal, QThread, QSize, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QRect
 from PySide6.QtGui import QPixmap, QIcon, QColor, QFont, QPainter, QPen, QBrush, QDragEnterEvent, QDropEvent, QImageReader
@@ -1435,6 +1436,12 @@ class OCRImageMatcher(QMainWindow):
         self.delete_unmatched_b_btn.clicked.connect(self.delete_unmatched_b_files)
         self.delete_unmatched_b_btn.setEnabled(False)
         center_vbox.addWidget(self.delete_unmatched_b_btn)
+
+        self.custom_suffix_btn = QPushButton("🏷 批量修改扩展名")
+        self.custom_suffix_btn.setStyleSheet(btn_style)
+        self.custom_suffix_btn.clicked.connect(self.apply_custom_extension_to_b_images)
+        self.custom_suffix_btn.setEnabled(False)
+        center_vbox.addWidget(self.custom_suffix_btn)
         # 选中两张图时显示匹配度
         self.pair_similarity_label = QLabel("请选择 A 组和 B 组各一张图片")
         self.pair_similarity_label.setStyleSheet("color: #605E5C; font-size: 11px; padding: 4px 0;")
@@ -1494,7 +1501,7 @@ class OCRImageMatcher(QMainWindow):
         center_vbox.addStretch(1)  # 底部弹性空间，与顶部对称实现垂直居中
 
         # 按钮宽度适应 240px 中间区
-        for btn in (self.clear_all_btn, self.clear_b_btn, self.delete_unmatched_b_btn, self.manual_match_btn):
+        for btn in (self.clear_all_btn, self.clear_b_btn, self.delete_unmatched_b_btn, self.custom_suffix_btn, self.manual_match_btn):
             btn.setMaximumWidth(216)
 
         # 隐藏按钮（供程序内部调用）
@@ -3060,6 +3067,9 @@ class OCRImageMatcher(QMainWindow):
         )
         self.delete_unmatched_b_btn.setEnabled(has_unmatched_b)
 
+        # 修改扩展名：通常在 OCR 完成后使用，要求当前有 B 组识别结果
+        self.custom_suffix_btn.setEnabled(has_b and len(self.group_b_images) > 0)
+
         # 同步更新顶部匹配进度概览
         self.update_summary()
 
@@ -3341,6 +3351,99 @@ class OCRImageMatcher(QMainWindow):
 
         # 不再弹出确认或完成对话框，仅在日志中提示结果，执行过程完全自动化
         self.log(f"批量重命名完成：成功 {success_count} 张，失败 {error_count} 张")
+
+    def apply_custom_extension_to_b_images(self):
+        """给当前 B 组图片批量修改扩展名（仅改文件名，不做格式转码）。"""
+        if not self.group_b_images:
+            QMessageBox.information(self, "提示", "当前没有可处理的 B 组图片。")
+            return
+
+        extension_text, ok = QInputDialog.getText(
+            self,
+            "批量修改扩展名",
+            "请输入新的扩展名（例如 .jpg 或 png）：\n注意：仅修改文件名扩展名，不转换图片实际编码格式。"
+        )
+        if not ok:
+            return
+
+        new_ext = (extension_text or "").strip().lower()
+        if not new_ext:
+            QMessageBox.warning(self, "警告", "扩展名不能为空。")
+            return
+        if not new_ext.startswith("."):
+            new_ext = f".{new_ext}"
+        if new_ext == ".":
+            QMessageBox.warning(self, "警告", "扩展名格式无效。")
+            return
+
+        invalid_chars = set('<>:"/\\|?*')
+        if any(ch in invalid_chars for ch in new_ext):
+            QMessageBox.warning(self, "警告", "扩展名包含非法字符：<>:\"/\\|?*")
+            return
+
+        success_count = 0
+        error_count = 0
+
+        for old_path in list(self.group_b_images):
+            try:
+                if not os.path.exists(old_path):
+                    error_count += 1
+                    self.log(f"❌ 添加后缀失败（文件不存在）：{os.path.basename(old_path)}")
+                    continue
+
+                old_dir = os.path.dirname(old_path)
+                old_name = os.path.basename(old_path)
+                stem = Path(old_path).stem
+                new_name = f"{stem}{new_ext}"
+                new_path = os.path.join(old_dir, new_name)
+
+                counter = 1
+                while os.path.exists(new_path) and not is_same_path(new_path, old_path):
+                    new_name = f"{stem}_{counter}{new_ext}"
+                    new_path = os.path.join(old_dir, new_name)
+                    counter += 1
+
+                if is_same_path(new_path, old_path):
+                    self.log(f"跳过：{old_name}（扩展名已是目标值）")
+                    continue
+
+                os.rename(old_path, new_path)
+
+                if old_path in self.group_b_images:
+                    idx = self.group_b_images.index(old_path)
+                    self.group_b_images[idx] = new_path
+
+                if old_path in self.group_b_texts:
+                    self.group_b_texts[new_path] = self.group_b_texts.pop(old_path)
+
+                if old_path in self.group_b_info:
+                    info = self.group_b_info.pop(old_path)
+                else:
+                    info = {}
+
+                if 'original_name' not in info:
+                    info['original_name'] = old_name
+                info['new_name'] = os.path.basename(new_path)
+                info['renamed'] = True
+                self.group_b_info[new_path] = info
+
+                if old_path in self.b_cards:
+                    old_card = self.b_cards.pop(old_path)
+                    old_card.deleteLater()
+                    self.create_b_card(new_path)
+                    if self.selected_b_card == old_card:
+                        self.selected_b_card = self.b_cards.get(new_path)
+
+                success_count += 1
+                self.log(f"✅ 修改扩展名成功：{old_name} → {os.path.basename(new_path)}")
+            except Exception as e:
+                error_count += 1
+                self.log(f"❌ 修改扩展名失败 {os.path.basename(old_path)}: {e}")
+
+        self.update_b_table()
+        self.update_buttons_state()
+        self._sync_current_folder_batch_snapshot()
+        self.log(f"批量修改扩展名完成：成功 {success_count} 张，失败 {error_count} 张")
     
     def manual_match(self):
         """确认手动配对"""
